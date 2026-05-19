@@ -145,6 +145,30 @@ The original brief is preserved verbatim in `project-brief.md`. README now refle
 
 ---
 
+## 2026-05-18 (Phase 5 v1 — starter gesture set landed)
+
+**Did:**
+- Wrote `firmware/GestureLab/GestureLab.ino`: tap-to-cycle test rig + three gestures.
+- Gestures shipped:
+  - `slow_blink` — display-only animation. Black bars close from top/bottom over 6 px steps × 18 ms, hold 180 ms, then restore. No servo motion.
+  - `curious_tilt` — `moveX(300, 300)` + `moveY(650, 300)` (slow simultaneous up-and-to-the-side), hold 1500 ms.
+  - `snap_look` — `moveX(800, 1000)` (max-speed snap), hold 1500 ms.
+- Trigger interface: M5StackChan's top-of-head capacitive touch sensor. Tap cycles through the gesture list. Label on screen shows which gesture is next.
+- Compiled (527 KB) and uploaded. Amber: "each are perfect" — first-pass values were good enough to ship without iteration.
+
+**Design notes for future work:**
+- Kept everything in the .ino file rather than carving out `gestures/Gestures.h` and `.cpp`. The `gestures/` top-level folder remains empty. When we add the next batch of gestures (sad_droop, excited_wiggle, freeze, sigh, confused_shake, happy_bounce, double_blink), or when a second sketch needs to share the gesture vocabulary, that's the trigger to extract into a proper library.
+- All three gesture funcs are blocking — they `delay()` to the end of the motion/animation. Fine for the lab, but the idle behavior loop in Phase 8 will need a non-blocking variant or a coroutine-style stepper so the system can keep responding to events during a gesture.
+- The "after gesture, return to home" hop is currently done in the loop rather than inside each gesture, which means a future caller composing gestures has to remember to reset. Worth refactoring when we add more gestures — each gesture should declare its end pose, and a sequencer handles transitions.
+
+**Next options (Amber's choice):**
+- **Extend Phase 5:** add sad_droop, excited_wiggle, freeze, sigh, confused_shake, happy_bounce, double_blink. Each is small; the time goes to tuning the feel.
+- **Phase 6: Sound pack.** Source/create 8–12 chiptune SFX, get them on the SD card, tie sounds to gestures.
+- **Phase 7: Mood state machine.** The valence/arousal/energy struct and decay.
+- **Pause.** Clean stop point — gesture vocabulary is live, robot's expressive in three ways already.
+
+---
+
 ## 2026-05-18 — Phase 0: project setup
 
 **Did:**
