@@ -1,16 +1,37 @@
 #include <Arduino.h>
 #include <M5StackChan.h>
 
+const uint16_t FACE_COLOR = TFT_DARKCYAN;
+
 // Forward declarations
 void slow_blink();
 void curious_tilt();
 void snap_look();
+void sad_droop();
+void excited_wiggle();
+void freeze();
+void sigh();
+void confused_shake();
+void happy_bounce();
+void double_blink();
 void show_label(const char* name);
 
-const uint16_t FACE_COLOR = TFT_DARKCYAN;
+typedef void (*gesture_fn_t)();
+struct Gesture { const char* name; gesture_fn_t fn; };
 
-const char* gesture_names[] = {"slow_blink", "curious_tilt", "snap_look"};
-const int gesture_count = 3;
+const Gesture gestures[] = {
+  {"slow_blink",     slow_blink},
+  {"curious_tilt",   curious_tilt},
+  {"snap_look",      snap_look},
+  {"sad_droop",      sad_droop},
+  {"excited_wiggle", excited_wiggle},
+  {"freeze",         freeze},
+  {"sigh",           sigh},
+  {"confused_shake", confused_shake},
+  {"happy_bounce",   happy_bounce},
+  {"double_blink",   double_blink},
+};
+const int gesture_count = sizeof(gestures) / sizeof(gestures[0]);
 int gesture_index = 0;
 
 void setup() {
@@ -22,23 +43,15 @@ void setup() {
 
 void loop() {
   M5StackChan.update();
-
   if (M5StackChan.TouchSensor.wasPressed()) {
-    const char* name = gesture_names[gesture_index];
-    show_label(name);
-
-    if (gesture_index == 0) slow_blink();
-    else if (gesture_index == 1) curious_tilt();
-    else if (gesture_index == 2) snap_look();
-
+    show_label(gestures[gesture_index].name);
+    gestures[gesture_index].fn();
     delay(300);
     M5StackChan.Motion.goHome();
     delay(1200);
     show_label("(tap head for next)");
-
     gesture_index = (gesture_index + 1) % gesture_count;
   }
-
   delay(20);
 }
 
@@ -71,4 +84,49 @@ void curious_tilt() {
 void snap_look() {
   M5StackChan.Motion.moveX(800, 1000);
   delay(1500);
+}
+
+void sad_droop() {
+  M5StackChan.Motion.moveY(100, 200);
+  delay(1500);
+}
+
+void excited_wiggle() {
+  M5StackChan.Motion.moveX(-200, 1000); delay(170);
+  M5StackChan.Motion.moveX( 200, 1000); delay(170);
+  M5StackChan.Motion.moveX(-200, 1000); delay(170);
+  M5StackChan.Motion.moveX( 200, 1000); delay(170);
+  M5StackChan.Motion.moveX(   0, 1000); delay(220);
+}
+
+void freeze() {
+  // Intentional stillness. The lack of motion IS the gesture.
+  delay(2000);
+}
+
+void sigh() {
+  M5StackChan.Motion.moveY(500, 200);
+  delay(700);
+  M5StackChan.Motion.moveY(120, 150);
+  delay(1300);
+}
+
+void confused_shake() {
+  M5StackChan.Motion.moveX(-100, 600); delay(160);
+  M5StackChan.Motion.moveX( 100, 600); delay(160);
+  M5StackChan.Motion.moveX(-100, 600); delay(160);
+  M5StackChan.Motion.moveX(   0, 600); delay(380);
+}
+
+void happy_bounce() {
+  M5StackChan.Motion.moveY(550, 900); delay(180);
+  M5StackChan.Motion.moveY(300, 900); delay(180);
+  M5StackChan.Motion.moveY(550, 900); delay(180);
+  M5StackChan.Motion.moveY(350, 700); delay(280);
+}
+
+void double_blink() {
+  slow_blink();
+  delay(120);
+  slow_blink();
 }
