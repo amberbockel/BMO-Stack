@@ -169,6 +169,33 @@ The original brief is preserved verbatim in `project-brief.md`. README now refle
 
 ---
 
+## 2026-05-18 (Phase 6 complete) — chiptune voice landed
+
+**Did:**
+- **Procedural tones instead of WAV-on-SD.** Amber doesn't have a microSD card on hand and the brief allowed "create or source" — procedural was both faster and matches what chiptune actually is (a chip making music). Defers SD card setup until we have a reason for it (e.g. richer sampled audio in a later phase).
+- Wrote 9 procedural sound functions in `GestureLab.ino`, all using `M5.Speaker.tone(freq, duration_ms)`:
+  - `play_boot` — 4 ascending major notes on startup ("I'm awake!").
+  - `play_delight` (→ happy_bounce), `play_huh` (→ confused_shake), `play_sad` (→ sad_droop), `play_curious` (→ curious_tilt), `play_surprise` (→ snap_look), `play_giggle` (→ excited_wiggle), `play_sleepy` (→ sigh), `play_ok` (defined but not yet wired).
+- Five gestures got audio; five stayed intentionally silent (slow_blink, freeze, sigh's lift phase, double_blink, the boot pose). Silence is also a sound design choice.
+- Speaker volume calibrated to 128/255 (~50%). Amber hasn't reported it being wrong, so we'll keep it.
+
+**Tuning round 1 — based on Amber's specific feedback:**
+- `play_delight`: tightened inter-note gaps from 85ms → 60ms. "More BMO bounce."
+- `play_sad`: expanded from 2 notes (A4 → F#4 — too neutral) to 4 notes (G4 → F4 → D4 → B3) with a long-held final note. Dropped pitch range significantly. Now reads as heavy.
+- `play_giggle`: expanded from 3 monotone-ish notes to 6 varied notes bouncing in C6/D6/E6/F6 range. "Chattery and giggly."
+- Amber: "better!" — direction confirmed, shipping this version.
+
+**Caveat captured:** I can't actually listen to YouTube clips Amber references. WebFetch on YouTube returns page metadata, not audio. Tuning was done from her verbal descriptions only. Worked this time; will work next time if descriptions stay specific.
+
+**Next: Phase 7 — mood state machine.**
+- Define `Mood { float valence; float arousal; float energy; }` with decay toward neutral.
+- Face background color computed from mood each frame.
+- Events (touch, gesture trigger, etc.) nudge mood values.
+- Decay rates and color mapping are aesthetic decisions to make with Amber, not technical defaults to silently pick.
+- Idle behavior selection (Phase 8) will eventually read this state — but Phase 7 is just the state itself.
+
+---
+
 ## 2026-05-18 — Phase 0: project setup
 
 **Did:**
