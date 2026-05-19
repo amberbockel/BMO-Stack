@@ -6,43 +6,25 @@ Newest entries on top. After every working session, append a new block: what we 
 
 ## NEXT SESSION — RESUME HERE
 
-> Pinned section. Read this first when you come back. Last updated 2026-05-19, end of session that built Phases 0–7 + drawn-face expressions.
+> Pinned section. Read this first when you come back. Last updated 2026-05-19, end of session that built Phase 8 (idle behavior loop).
 
 ### Where we are (one paragraph)
 
-Eleven commits in git, latest is `5ec4a25`. The robot has: factory firmware safely backed up (`backup/factory-firmware-2026-05-18.bin` + RESTORE.md), a 10-gesture body language vocabulary (`firmware/GestureLab/`), a 9-sound procedural chiptune voice (also in GestureLab), a mood state machine with decay-toward-neutral over 30–120s (`firmware/MoodLab/`), and a drawn BMO face on the MoodLab screen with white teeth on smile, dark dot eyes, auto-blinks every 3–7s, and a color that shifts with valence and energy. MoodLab v6 is what's currently on the chip.
+Thirteen commits in git, latest after this session covers Phase 8. The robot has: factory firmware safely backed up (`backup/factory-firmware-2026-05-18.bin` + RESTORE.md), a 10-gesture body language vocabulary (`firmware/GestureLab/`), a 9-sound procedural chiptune voice (in GestureLab), a mood state machine with decay (`firmware/MoodLab/`), a drawn BMO face with 6 eye states + 5 mouth shapes, and **autonomous idle behaviors** (`firmware/IdleLab/`) — quiet timer fires weighted-random behaviors every 5–20s, plus micro-fidgets every 2.5–5.5s for continuous "alive" motion. IdleLab v5 is what's on the chip and Amber called it "delightful."
 
 ### First three things to do when resuming
 
 1. **Re-orient.** Read `notes/project-brief.md` (the original goal), this resume section, and the most recent chronological log entry below. ~5 min.
-2. **Verify the toolchain still works.** Plug the robot in. Run `ls /dev/cu.*` — note the new port name (the trailing digits can change between sessions). Re-upload MoodLab to confirm flow:
+2. **Verify the toolchain still works.** Plug the robot in. Run `ls /dev/cu.*` — note the new port name (trailing digits can change between sessions). Re-upload IdleLab to confirm flow:
    ```
    CLI="/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli"
    cd ~/stackchan-bmo
-   "$CLI" compile --fqbn m5stack:esp32:m5stack_cores3 firmware/MoodLab
-   "$CLI" upload  --fqbn m5stack:esp32:m5stack_cores3 --port /dev/cu.usbmodemXXXX firmware/MoodLab
+   "$CLI" compile --fqbn m5stack:esp32:m5stack_cores3 firmware/IdleLab
+   "$CLI" upload  --fqbn m5stack:esp32:m5stack_cores3 --port /dev/cu.usbmodemXXXX firmware/IdleLab
    ```
-3. **Start Phase 8** (the BMO core — idle behavior loop). Design below.
+3. **Begin Phase 9 prep.** Make the four architecture decisions below before writing any networking code. They're more important than another sketch iteration.
 
-### Phase 8 starting plan (draft — expect tuning)
-
-- New sketch: `firmware/IdleLab/IdleLab.ino`. Copies Mood + face rendering from MoodLab, adds an idle behavior loop on top.
-- Quiet-detection: track `last_interaction_ms` on every touch; fire an idle behavior when `millis() - last_interaction_ms` exceeds a mood-modulated threshold (15–25 s when aroused, 40–60 s when low-energy, ~30 s baseline).
-- Idle behavior pool (new, to be designed):
-  - `hum_short` — 4-note chiptune phrase, composing from existing tones.
-  - `look_around` — pan L → pause → pan R → pause → recenter.
-  - `talk_to_corner` — turn head to a corner, play babbling phrase (multiple chiptune tones).
-  - `practice_speech` — small head movements + repeating phrases (rehearsing for a future conversation).
-  - `idle_blink` — single slow_blink, nothing else.
-  - Plus occasional weighted-random picks of the existing emotion gestures.
-- Weight table is mood-biased:
-  - High arousal → shorter quiet timeouts, more bouncy picks.
-  - Low energy → slow/sleepy picks (sigh, slow_blink), longer timeouts.
-  - High valence → happy picks (excited_wiggle, happy_bounce, hum_short).
-  - Low valence → quiet picks (sigh, sad_droop, freeze).
-- **The real work is tuning the weights and timings** so it feels alive without being annoying. The brief says: *"Spend real time tuning weights and behaviors here."* Expect 30+ minutes of watching the robot and adjusting numbers.
-
-### Phase 9 decisions to make before writing any networking code
+### Phase 9 — decide architecture BEFORE writing networking code
 
 These are flagged from earlier in the project but not resolved. Decide before Phase 9 begins.
 
@@ -310,6 +292,32 @@ The original brief is preserved verbatim in `project-brief.md`. README now refle
   - Low energy → more sleepy / slow gestures.
   - High valence → more bouncy / happy ones.
 - The brief explicitly says: **"Spend real time tuning weights and behaviors here."** This is where the tune-over-ship rule earns its keep.
+
+---
+
+## 2026-05-19 (Phase 8 complete) — the BMO core: autonomous idle behaviors
+
+**Did:** Built the idle behavior loop — the brief's "BMO core" — through five iteration rounds with Amber's feedback driving each one. `firmware/IdleLab/IdleLab.ino`.
+
+- **v1.** Foundation. Quiet timer + weighted-random pool of 10 behaviors (6 new, 4 reused from GestureLab). Weights biased by mood. Timeout base 30 s, clamps [15, 60] s.
+- **v2.** Amber: "feels too infrequent, doesn't feel alive." Also: movement and facial expressions don't match. Tightened timeout (base 15 s, clamps [8, 30]). Added per-behavior MOOD NUDGES so the face responds via the existing mood→face mapping.
+- **v3.** Added variety: 5 hum melodies, 5 babble patterns + random left/right side for `talk_to_corner`, 4 practice-speech phrases. Plus three new face states — `EyeState::CONTENT` (^^ closed-happy, valence>0.5 and arousal<0.5), `EyeState::ASLEEP` (uu drooping closed, energy<0.15), `MouthShape::GRIN` (wider/deeper smile, valence>0.6).
+- **v4.** Amber: "movement + expressions still don't match. when we move/react i'd like to see a facial expression AND color change." Fix: per-behavior FACE OVERRIDE — `happy_bounce` always shows GRIN + WIDE eyes during itself regardless of starting mood. Override held 4 s. Bigger mood nudges in parallel (happy_bounce v +0.40 → +0.70, sigh v -0.15 → -0.40, etc.) so color changes are dramatic.
+- **v5.** Amber: "could feel a little faster and smoother." Reduced timeout further (base 10 s, clamps [5, 20]). Added MICRO-FIDGET LAYER: tiny head twitches (~5° pan or small tilt) at 2.5–5.5 s intervals, 60% chance per fire, 40% no-op. Skipped during behavior override windows. Robot is never visibly motionless for more than ~5 s. Amber: **"delightful i love it."** Shipped.
+
+**Final cadence math:**
+- Base 10 s × `(1.5 − arousal)` × `(1.7 − energy)`, clamped to [5, 20] s.
+- Neutral mood (a=0.3, e=0.5): ~14 s between full behaviors.
+- Excited+perky: floors at 5 s. Calm+tired: ceils at 20 s.
+- Plus micro-fidgets every 2.5–5.5 s independent of full firings.
+- **Deviation from brief noted:** brief said 15–60 s. In practice that range felt dead. We're at 5–20 s. Brief stays verbatim; deviation lives here.
+
+**Architecture banked for Phase 9:**
+- The face-override system is the right abstraction for chat states. Phase 9's "listening" / "thinking" / "speaking" states will set their own override eye + mouth, same way idle behaviors do. Plumbing already exists.
+- Mood nudge pattern (each event adjusts mood slightly + decays) gives a natural "BMO seems happier the more I talk to it" arc when conversation events feed in.
+- Micro-fidget timing is independent of behavior firings — a Phase 9 chat state can pause it by setting override fields the same way idle behaviors do.
+
+**Next: Phase 9 — conversation layer.** Four architecture decisions in the resume note must be made before any networking code lands. See top of this file.
 
 ---
 
