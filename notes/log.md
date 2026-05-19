@@ -63,6 +63,33 @@ The original brief is preserved verbatim in `project-brief.md`. README now refle
 
 ---
 
+## 2026-05-18 (Phase 3 complete) — factory firmware backed up
+
+**Did:**
+- Skipped installing esptool separately — used the copy bundled with the M5Stack Arduino package at `~/Library/Arduino15/packages/m5stack/tools/esptool_py/5.1.0/esptool`. Same version Arduino IDE uses internally, so no version-mismatch risk later.
+- Confirmed chip identity with `esptool chip-id`: ESP32-S3 (QFN56) rev v0.2, MAC `44:1b:f6:e1:f6:d4`, USB-Serial/JTAG mode (confirming native USB).
+- Confirmed flash size with `esptool flash-id`: 16 MB, manufacturer 0x46 device 0x4018 (GigaDevice quad SPI at 3.3V).
+- Read the full 16 MB of flash from `0x0` to `0x1000000` to `backup/factory-firmware-2026-05-18.bin`.
+- Verified file size = exactly 16,777,216 bytes.
+- Computed SHA-256: `d4c9ba8d48c069a08c9dd6154867a1d514742e0ec6715121ecfbb4f5f6ddee35`.
+- Wrote `backup/RESTORE.md` with the verify-hash, find-port, write-flash recipe plus troubleshooting.
+- Confirmed robot rebooted into factory firmware after the read (screensaver bouncing again — Amber verified visually).
+
+**Surprises:**
+- Read took ~24 minutes (1469.6s at 91.3 kbit/s), not the 60–90 seconds I predicted. Default baud rate on the CoreS3's USB-Serial/JTAG mode is much slower than the typical ESP32-S3 over UART. **For future esptool ops we should pass `--baud 921600` (or higher) to get reasonable speeds.** Tested theory: I owe a faster write-flash on Phase 2.
+
+**Key facts captured for the project:**
+- Robot's serial port today: `/dev/cu.usbmodem1101` (trailing digits may change between sessions).
+- Robot's MAC: `44:1b:f6:e1:f6:d4`. This is the only StackChan with that MAC — if we ever own a second one, we'd know from this.
+
+**Next: Phase 2 — Hello World flash.**
+- Find Hello World example in Arduino IDE → File → Examples → M5CoreS3 (or under the M5Unified library, depending on what M5Stack ships).
+- Compile and upload via Arduino IDE Upload button (NOT esptool — let IDE drive it for the first flash so we have a known-good baseline).
+- Goal: "Hello World" visible on the screen.
+- Goal #2: prove the toolchain is working end-to-end before we start writing custom code.
+
+---
+
 ## 2026-05-18 — Phase 0: project setup
 
 **Did:**
