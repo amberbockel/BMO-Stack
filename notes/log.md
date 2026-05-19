@@ -116,6 +116,35 @@ The original brief is preserved verbatim in `project-brief.md`. README now refle
 
 ---
 
+## 2026-05-18 (Phase 4 complete) — head moves on command
+
+**Did:**
+- Researched the StackChan hardware: it uses **SCS0009 serial-bus servos** (not PWM hobby servos), wired to GPIO 6 (TX) / GPIO 7 (RX) at 1 Mbaud. Address by ID over a single-wire-ish serial bus.
+- Installed M5Stack's official `M5StackChan` library 1.0.1 (plus deps M5UnitUnified, M5Utility, M5HAL, IRremoteESP8266, M5Unit-NFC). High-level API: `M5StackChan.Motion.moveX/moveY/move/goHome/rotateX`.
+- Wrote `firmware/FirstMotion/FirstMotion.ino`: init, goHome, then loop snapping pan to `-600`, hold 2s, pan to `+600`, hold 2s, repeat. Speed 1000 (max) for the snap-then-freeze aesthetic.
+- Compiled (526 KB / 16% of program partition — only +36 KB over Hello World).
+- Uploaded. Amber confirmed: head moves, snappy not smooth, pauses cleanly, no concerning sounds, "looks great."
+
+**Conventions captured for the gesture library:**
+- `M5StackChan.Motion.moveX(angle, speed)`:
+  - `angle` is **tenths of a degree** (so `600` = 60°). X range: `-1280..1280`. Y range: `0..900`.
+  - `speed` is `0..1000`. **1000 + delay = snap-then-freeze** (our aesthetic).
+- **From the viewer's perspective looking at the robot's face: `-X = left, +X = right`**. (Example file labels are robot-perspective and flipped.) Use viewer perspective going forward — matches natural human spatial language for the gesture vocabulary.
+- Y axis: 0 is straight ahead, 900 is fully tilted up. Recommended safe band: **50–850 (5°–85°)**. Avoid hitting the rails.
+- `M5StackChan.update()` should be called regularly in `loop()` (auto angle sync; touch sensor polling).
+
+**Resources used:**
+- M5StackChan library (Arduino Library Manager).
+
+**Next: Phase 5 — Gesture library v1.**
+- Build small C++ library of named gestures, starting with `slow_blink`, `curious_tilt`, `snap_look`.
+- Each gesture: a function with parameters (target angle, speed, hold time) that drives servos + display.
+- Test sketch should let me trigger each gesture by pressing one of the CoreS3 buttons / touch zones, so I can iterate on the feel.
+- Files: `gestures/Gestures.h` + `gestures/Gestures.cpp`, plus `firmware/GestureLab/GestureLab.ino` for testing.
+- This is the start of where "tune is more important than ship" really kicks in.
+
+---
+
 ## 2026-05-18 — Phase 0: project setup
 
 **Did:**
