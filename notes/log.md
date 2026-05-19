@@ -37,6 +37,32 @@ The original brief is preserved verbatim in `project-brief.md`. README now refle
 
 ---
 
+## 2026-05-18 (Phase 1 complete) — toolchain ready, hardware identified
+
+**Did:**
+- M5Stack board package version 3.3.7 installed under `~/Library/Arduino15/packages/m5stack/`.
+- Found that the Arduino IDE menu label for the CoreS3 is **`M5CoreS3`** (one word), not "CoreS3" as the M5Stack docs navigation suggested. Verified by grepping `boards.txt`: only one CoreS3 board is defined — `m5stack_cores3.name=M5CoreS3`. Amber selected it.
+- First hardware moment: plugged robot in via USB-C. Factory firmware booted (screensaver bouncing on screen, red power LED on back, no audible sound, no servo motion observed).
+- Robot enumerated as **`/dev/cu.usbmodem1101`**.
+
+**Confirmed:**
+- CoreS3 uses ESP32-S3 native USB (CDC). The `usbmodem` prefix proves this — no CH9102/CP210x driver needed on macOS.
+- The USB-C cable Amber used is data-capable (port appeared at all).
+- Factory firmware is functional and boots normally.
+
+**Caveats:**
+- The trailing digits on `usbmodem1101` can change between sessions or USB ports. Always re-check with `ls /dev/cu.*` before flashing.
+
+**Next: Phase 3 — factory firmware backup.**
+- Install esptool (the command-line tool that talks to ESP32 chips for read/write/erase). Likely via `pipx install esptool` or `pip install esptool` inside a venv.
+- Read the full 16 MB of flash from the robot to `backup/factory-firmware-2026-05-18.bin`.
+- Verify file size is exactly 16 MB (16,777,216 bytes).
+- Write `backup/RESTORE.md` with the exact command to flash the backup back onto the robot.
+- Confirm the robot still boots normally after the backup read (no writes happen during a read, but worth verifying).
+- Commit everything to git.
+
+---
+
 ## 2026-05-18 — Phase 0: project setup
 
 **Did:**
