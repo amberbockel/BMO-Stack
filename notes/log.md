@@ -90,6 +90,32 @@ The original brief is preserved verbatim in `project-brief.md`. README now refle
 
 ---
 
+## 2026-05-18 (Phase 2 complete) — Hello, BMO on the screen
+
+**Did:**
+- Found the bundled `arduino-cli` inside Arduino IDE 2.x at `/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli` (v1.4.1). Confirmed it shares the same `~/Library/Arduino15/` data dir as the GUI, so all packages and libraries are visible from CLI. **Pivot from the brief's GUI-driven plan: from here on, compile and upload happen via `arduino-cli` from the command line. Faster, more visible, and removes a class of "I can't find that menu" friction.**
+- Installed `M5Unified` 0.2.15 and its dependency `M5GFX` 0.2.21 via `arduino-cli lib install M5Unified`.
+- Wrote `firmware/HelloWorld/HelloWorld.ino` — minimal sketch: init M5Unified, fill screen `TFT_DARKCYAN`, draw "Hello, BMO" in white.
+- First compile failed with `fork/exec ...ctags: bad CPU type in executable` because the bundled `ctags 5.8-arduino11` is Intel-only and Rosetta 2 was missing on this Apple Silicon Mac. Installed Rosetta 2 with `sudo softwareupdate --install-rosetta --agree-to-license` (Amber ran this in her own Terminal because sudo password prompts don't pass cleanly through Claude Code's Bash).
+- Recompiled cleanly: sketch uses 15% of program flash, 7% of RAM. Headroom is plentiful.
+- Uploaded to `/dev/cu.usbmodem1101` via `arduino-cli upload`. Upload took ~3s for the main payload at 1521 kbit/s (because arduino-cli auto-changes baud to 921600 during the write — see the lesson below).
+- Robot booted into our sketch: teal screen with "Hello, BMO" in white. Amber confirmed visually. Factory firmware is now overwritten on the chip; backup is preserved in git (commit f88e490) and on disk.
+
+**Lesson, retroactive:** the 24-minute Phase 3 read happened because `esptool read-flash` didn't change baud rates the way `arduino-cli upload` does. The fix when we do another full read (or partial reads later) is `--baud 921600`. Recorded this in `backup/RESTORE.md` mentally; should probably update the file too if we restore in earnest.
+
+**Resources used:**
+- `arduino-cli` bundled in Arduino IDE 2.x app bundle (no separate install needed).
+- M5Unified library (Arduino Library Manager).
+- Rosetta 2 (system install — required for the bundled ctags to run on Apple Silicon).
+
+**Next: Phase 4 — First servo motion.**
+- Look up the servo pin assignments for the official Jan 2026 StackChan (head pan and tilt). M5Stack docs or schematic.
+- Decide on a servo library: `ESP32Servo`, M5Stack's `ServoEasing`, or the bundled approach. Start simple — use whatever the official M5Stack Stack-Chan example uses.
+- Write a small `firmware/FirstMotion/FirstMotion.ino` that snaps head left, pauses, snaps right, pauses. Snap-then-hold per the brief's movement aesthetic, not smooth sweep.
+- Upload, watch head move.
+
+---
+
 ## 2026-05-18 — Phase 0: project setup
 
 **Did:**
