@@ -16,7 +16,15 @@ The full creative goal, voice rules, gesture library, mood model, and phase-by-p
 
 ## Where we are
 
-Phase 0 — project setup. See `notes/log.md` for the running session journal.
+Phase 1 — toolchain setup. Arduino IDE 2.3.8 installed; M5Stack board manager URL added; M5Stack board package install in progress.
+
+## Plan correction (2026-05-18)
+
+The brief in `notes/project-brief.md` lists **Phase 2: Hello World flash** *before* **Phase 3: factory firmware backup**. Flashing Hello World would overwrite the factory firmware before we'd captured it, which violates the project rule that the factory backup is sacred.
+
+**Corrected order:** Phase 3 (factory backup) runs **before** Phase 2 (Hello World flash). The robot is read out to a `.bin` and that file is committed to git *before* any custom code is flashed.
+
+The original brief is preserved verbatim. This correction is the authoritative plan going forward. See `notes/log.md` for the session entry where this was caught.
 
 ## Rules
 
