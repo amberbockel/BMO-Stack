@@ -14,13 +14,19 @@
 #include <M5StackChan.h>
 #include <M5Unified.h>
 #include <math.h>
+// Phase 9b: Wi-Fi provisioning
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <DNSServer.h>
+#include <ESPmDNS.h>
 
 // === Hoisted types (Arduino auto-prototype workaround) ===
 // Any type referenced in a function signature must be defined here, not
 // next to the section that uses it, because Arduino auto-inserts forward
 // declarations for all functions at the top of the file.
 enum class MouthShape { SMILE, NEUTRAL, FROWN, OPEN, GRIN };
-enum class EyeState   { BLINK, SLEEPY, NORMAL, WIDE, CONTENT, ASLEEP };
+enum class EyeState   { BLINK, SLEEPY, NORMAL, WIDE, CONTENT, ASLEEP, SWIRL, HEART };
 struct IdleBehavior {
   const char* name;
   void (*fn)();
@@ -165,6 +171,27 @@ void draw_eye(int cx, int cy, EyeState s) {
         face_buffer.drawLine(cx + 3, cy + 1 + dy, cx + 8, cy - 3 + dy, FEATURE_COLOR);
       }
       break;
+    case EyeState::SWIRL: {
+      // Dizzy/spinning eyes -- bigger, off-center concentric pattern.
+      face_buffer.drawCircle(cx, cy, 14, FEATURE_COLOR);
+      face_buffer.drawCircle(cx, cy, 13, FEATURE_COLOR);  // double-thick outer
+      face_buffer.drawCircle(cx + 3, cy + 2, 8, FEATURE_COLOR);  // off-center
+      face_buffer.drawCircle(cx + 3, cy + 2, 7, FEATURE_COLOR);  // double inner
+      face_buffer.fillCircle(cx + 5, cy + 3, 3, FEATURE_COLOR);  // center dot
+      break;
+    }
+    case EyeState::HEART: {
+      // Love-struck pet eyes -- deep red heart, 50% bigger than v2.
+      uint16_t red = face_buffer.color565(200, 30, 50);
+      face_buffer.fillCircle(cx - 6, cy - 3, 7, red);
+      face_buffer.fillCircle(cx + 6, cy - 3, 7, red);
+      face_buffer.fillTriangle(
+        cx - 12, cy,
+        cx + 12, cy,
+        cx,      cy + 13,
+        red);
+      break;
+    }
   }
 }
 
@@ -212,7 +239,15 @@ extern bool face_override_active;
 extern EyeState face_override_eye;
 extern MouthShape face_override_mouth;
 extern unsigned long face_override_until;
+// Phase 9a state
+extern bool sleeping;
+extern const char* pwr_debug_label;
+extern unsigned long pwr_debug_until;
 float quiet_timeout_seconds();
+void dizzy_gesture();
+
+extern bool show_pink_cheeks;
+extern unsigned long pink_cheeks_until;
 
 void draw_face(bool blinking) {
   face_buffer.fillScreen(mood_to_color(mood));
@@ -228,6 +263,15 @@ void draw_face(bool blinking) {
     if (face_override_active) face_override_active = false;
     eye_s   = compute_eye_state(mood, blinking);
     mouth_s = compute_mouth(mood);
+  }
+
+  // Pink cheeks during dizzy. 50% bigger than v2 for more drama.
+  if (show_pink_cheeks && now_ms < pink_cheeks_until) {
+    uint16_t pink = face_buffer.color565(255, 130, 160);
+    face_buffer.fillCircle(40,  135, 20, pink);
+    face_buffer.fillCircle(280, 135, 20, pink);
+  } else if (show_pink_cheeks) {
+    show_pink_cheeks = false;
   }
 
   draw_eye(80,  90, eye_s);
@@ -251,7 +295,18 @@ void draw_face(bool blinking) {
     face_buffer.printf("idle: %s", current_idle_label);
   }
 
-  // Debug strip -- mood, quiet timer status, next mood event
+  // Power-button debug indicator -- only visible when the button fires.
+  if (pwr_debug_label != nullptr && now < pwr_debug_until) {
+    face_buffer.setTextSize(2);
+    face_buffer.setTextColor(TFT_YELLOW);
+    face_buffer.setCursor(220, 5);
+    face_buffer.print(pwr_debug_label);
+  }
+
+  // Tiny "wifi" indicator in the top-left when connected
+  draw_wifi_status_indicator();
+
+  // Debug strip -- mood + idle timer status (hide later when "shipping")
   face_buffer.setTextSize(1);
   face_buffer.setTextColor(FEATURE_COLOR);
   face_buffer.setCursor(5, 218);
@@ -259,8 +314,8 @@ void draw_face(bool blinking) {
   face_buffer.setCursor(5, 228);
   float quiet_s = (millis() - last_interaction_ms) / 1000.0f;
   float timeout = quiet_timeout_seconds();
-  face_buffer.printf("quiet:%4.1fs / %4.1fs   next:%s",
-    quiet_s, timeout, events[next_event_index].name);
+  face_buffer.printf("quiet:%4.1fs/%4.1fs  pet/swipe/shake/pwr",
+    quiet_s, timeout);
 
   face_buffer.pushSprite(&M5StackChan.Display(), 0, 0);
 }
@@ -527,6 +582,510 @@ void maybe_fire_idle() {
   }
 }
 
+// === Phase 9a: LED breathing pulse at mood color ===
+// 12 RGB LEDs in two rows. Always-on subtle breathing at the current mood
+// color, brightness modulated by a sine wave over a 3 s period. Adds the
+// "soft glow" layer of liveness independent of head motion.
+
+unsigned long last_led_update_ms = 0;
+unsigned long led_phase_start_ms = 0;
+
+// LED override -- behaviors (pet, dizzy, future voice commands) can
+// take over the LEDs temporarily. After the until-time, breathing
+// returns. Also exposes a hook the LLM tool layer will use later
+// for commands like "BMO, turn your lights red."
+bool led_override_active = false;
+uint8_t led_override_r = 0, led_override_g = 0, led_override_b = 0;
+unsigned long led_override_until = 0;
+bool led_override_flash = false;  // if true, alternate full/dim instead of solid
+
+void set_led_override(uint8_t r, uint8_t g, uint8_t b, unsigned long ms, bool flash) {
+  led_override_active = true;
+  led_override_r = r; led_override_g = g; led_override_b = b;
+  led_override_until = millis() + ms;
+  led_override_flash = flash;
+}
+
+void update_leds() {
+  unsigned long now = millis();
+  if (now - last_led_update_ms < 50) return;
+  last_led_update_ms = now;
+
+  // Override mode -- show a solid (or flashing) color until the timer expires.
+  if (led_override_active && now < led_override_until) {
+    uint8_t r = led_override_r, g = led_override_g, b = led_override_b;
+    if (led_override_flash) {
+      // Flash on/off at 8 Hz
+      if ((now / 125) % 2 == 0) { r = 0; g = 0; b = 0; }
+    }
+    for (int i = 0; i < 12; i++) M5StackChan.setRgbColor(i, r, g, b);
+    M5StackChan.refreshRgb();
+    return;
+  } else if (led_override_active) {
+    led_override_active = false;
+  }
+
+  // Breathing brightness, 3 s sinusoidal period, 10%..100% of LED ceiling
+  float phase = ((now - led_phase_start_ms) % 3000) / 3000.0f;
+  float breath = 0.10f + 0.90f * (0.5f - 0.5f * cosf(phase * 2.0f * PI));
+
+  // Mood-derived hue (same math as mood_to_color, in float-space)
+  float r = 55, g = 200, b = 170;
+  if (mood.valence > 0) {
+    r += mood.valence * 150; g += mood.valence * 30; b -= mood.valence * 80;
+  } else {
+    r -= (-mood.valence) * 30; g -= (-mood.valence) * 130; b += (-mood.valence) * 50;
+  }
+  // Scale by energy (mood brightness) AND breath. Final 0.35x is the LED
+  // intensity ceiling -- LEDs are bright physical things, don't max them out.
+  float bm = (0.4f + mood.energy * 0.6f) * breath * 0.35f;
+  r *= bm; g *= bm; b *= bm;
+  uint8_t ri = (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));
+  uint8_t gi = (uint8_t)(g < 0 ? 0 : (g > 255 ? 255 : g));
+  uint8_t bi = (uint8_t)(b < 0 ? 0 : (b > 255 ? 255 : b));
+
+  for (int i = 0; i < 12; i++) {
+    M5StackChan.setRgbColor(i, ri, gi, bi);
+  }
+  M5StackChan.refreshRgb();
+}
+
+void leds_off() {
+  for (int i = 0; i < 12; i++) M5StackChan.setRgbColor(i, 0, 0, 0);
+  M5StackChan.refreshRgb();
+}
+
+// === Phase 9a: IMU shake detection -> dizzy_gesture ===
+// Samples accelerometer at ~30 Hz. A "peak" is a magnitude reading above
+// 1.7 g (gravity is ~1.0 g). When 3+ peaks land within 1.5 s, the robot
+// has been shaken -- fire the dizzy reaction.
+
+unsigned long shake_peaks[5] = {0,0,0,0,0};
+int shake_peak_idx = 0;
+unsigned long last_shake_sample_ms = 0;
+
+void check_shake() {
+  unsigned long now = millis();
+  if (now - last_shake_sample_ms < 30) return;
+  last_shake_sample_ms = now;
+
+  float ax = 0, ay = 0, az = 0;
+  if (!M5.Imu.getAccelData(&ax, &ay, &az)) return;
+  float mag = sqrtf(ax*ax + ay*ay + az*az);
+
+  if (mag > 1.7f) {
+    // Debounce: don't record a new peak within 100 ms of the last one
+    if (now - shake_peaks[shake_peak_idx] > 100) {
+      shake_peak_idx = (shake_peak_idx + 1) % 5;
+      shake_peaks[shake_peak_idx] = now;
+    }
+  }
+
+  int recent = 0;
+  for (int i = 0; i < 5; i++) {
+    if (shake_peaks[i] > 0 && (now - shake_peaks[i]) < 1500) recent++;
+  }
+  if (recent >= 3) {
+    for (int i = 0; i < 5; i++) shake_peaks[i] = 0;
+    last_interaction_ms = now;  // shake counts as interaction
+    dizzy_gesture();
+  }
+}
+
+void dizzy_gesture() {
+  // Face: SWIRL eyes (off-center concentric rings) + open mouth, plus
+  // pink cheek blush, locked for ~3.5 s.
+  face_override_active = true;
+  face_override_eye    = EyeState::SWIRL;
+  face_override_mouth  = MouthShape::OPEN;
+  face_override_until  = millis() + 3500;
+  show_pink_cheeks     = true;
+  pink_cheeks_until    = millis() + 3500;
+
+  // LEDs flash hot pink/red for the duration
+  set_led_override(220, 60, 100, 3500, true);
+
+  current_idle_label   = "dizzy!";
+  idle_label_until     = millis() + 3000;
+
+  // Force a face redraw so user sees the dizzy expression immediately
+  draw_face(false);
+
+  // Wobble head left/right, amplitude decaying
+  M5StackChan.Motion.moveX(-350, 600); delay(180);
+  M5StackChan.Motion.moveX( 350, 600); delay(180);
+  M5StackChan.Motion.moveX(-280, 500); delay(200);
+  M5StackChan.Motion.moveX( 280, 500); delay(200);
+  M5StackChan.Motion.moveX(-180, 400); delay(220);
+  M5StackChan.Motion.moveX( 180, 400); delay(220);
+  M5StackChan.Motion.moveX(   0, 300); delay(300);
+
+  // Descending wobbly tones
+  for (int i = 0; i < 4; i++) {
+    M5.Speaker.tone(700 - i * 90, 140); delay(150);
+    M5.Speaker.tone(500 - i * 60, 140); delay(150);
+  }
+
+  // Mood: high arousal (jangled), dropped energy (tired), slight negative
+  mood.arousal = Mood::clamp01(mood.arousal + 0.40f);
+  mood.energy  = Mood::clamp01(mood.energy  - 0.25f);
+  mood.valence = Mood::clamp11(mood.valence - 0.20f);
+}
+
+// === Phase 9a: Touch reactions (pet / swipe) ===
+// Replaces the mood-event-cycling tap UX from MoodLab. Now click = pet,
+// swipe forward = excited "yes!", swipe backward = calming pet.
+
+void on_pet_click() {
+  mood.valence = Mood::clamp11(mood.valence + 0.40f);  // bigger bump
+  mood.arousal = Mood::clamp01(mood.arousal + 0.15f);
+  mood.energy  = Mood::clamp01(mood.energy  + 0.10f);
+
+  // Love-struck heart eyes + grin for ~2 s. Dramatic, can't miss it.
+  face_override_active = true;
+  face_override_eye    = EyeState::HEART;
+  face_override_mouth  = MouthShape::GRIN;
+  face_override_until  = millis() + 2000;
+
+  // Soft pink LED pulse to match the hearts
+  set_led_override(255, 105, 160, 2000, false);
+
+  current_idle_label = "love!";
+  idle_label_until   = millis() + 1500;
+  M5.Speaker.tone(880, 60); delay(70);
+  M5.Speaker.tone(1047, 80); delay(85);
+  last_interaction_ms = millis();
+}
+
+void on_swipe_forward() {
+  mood.valence = Mood::clamp11(mood.valence + 0.40f);
+  mood.arousal = Mood::clamp01(mood.arousal + 0.30f);
+  mood.energy  = Mood::clamp01(mood.energy  + 0.20f);
+
+  face_override_active = true;
+  face_override_eye    = EyeState::WIDE;
+  face_override_mouth  = MouthShape::GRIN;
+  face_override_until  = millis() + 2500;
+
+  current_idle_label = "swipe!";
+  idle_label_until   = millis() + 1800;
+  M5.Speaker.tone(523, 60);  delay(65);
+  M5.Speaker.tone(784, 60);  delay(65);
+  M5.Speaker.tone(1047, 120); delay(130);
+  last_interaction_ms = millis();
+}
+
+void on_swipe_backward() {
+  mood.valence = Mood::clamp11(mood.valence + 0.30f);
+  mood.arousal = Mood::clamp01(mood.arousal - 0.20f);
+  mood.energy  = Mood::clamp01(mood.energy  + 0.10f);
+
+  face_override_active = true;
+  face_override_eye    = EyeState::CONTENT;
+  face_override_mouth  = MouthShape::SMILE;
+  face_override_until  = millis() + 2500;
+
+  current_idle_label = "calming";
+  idle_label_until   = millis() + 1800;
+  M5.Speaker.tone(659, 200); delay(210);
+  M5.Speaker.tone(523, 250); delay(260);
+  last_interaction_ms = millis();
+}
+
+// === Phase 9a: Power button -> sleep / wake / deep sleep ===
+// Short press toggles a soft sleep state (display dim, LEDs off, no idle
+// motion). Long press (2 s+) puts the chip into deep sleep -- press
+// button again to wake.
+
+bool sleeping = false;
+unsigned long sleep_started_ms = 0;
+const uint8_t SLEEP_BRIGHTNESS = 30;   // dim, conserves battery
+const uint8_t WAKE_BRIGHTNESS  = 255;  // full
+
+void enter_sleep() {
+  sleeping = true;
+  sleep_started_ms = millis();
+  M5StackChan.Motion.goHome();
+  M5StackChan.Display().setBrightness(SLEEP_BRIGHTNESS);
+  leds_off();
+  // Clear any face overrides so the sleep face shows clean
+  face_override_active = false;
+  show_pink_cheeks     = false;
+}
+
+void exit_sleep() {
+  sleeping = false;
+  M5StackChan.Display().setBrightness(WAKE_BRIGHTNESS);
+  last_interaction_ms = millis();
+  last_render_ms      = 0;
+  led_phase_start_ms  = millis();
+}
+
+// Render the sleep face: dim mood-color background, ASLEEP eyes, mouth
+// gently breathing open/closed, "Zz" letters drifting upward.
+void draw_sleep_face() {
+  face_buffer.fillScreen(mood_to_color(mood));
+
+  // Eyes: ASLEEP shape
+  draw_eye(80,  90, EyeState::ASLEEP);
+  draw_eye(240, 90, EyeState::ASLEEP);
+
+  // Mouth: breathing animation, 4 s cycle, oval grows then shrinks
+  unsigned long now = millis();
+  float bp = ((now - sleep_started_ms) % 4000) / 4000.0f;
+  float breath = 0.5f - 0.5f * cosf(bp * 2.0f * PI);  // 0..1
+  int mouth_ry = (int)(2 + breath * 7);  // 2..9 px tall
+  face_buffer.fillEllipse(160, 130, 14, mouth_ry, FEATURE_COLOR);
+
+  // Zz letters: drift upward + cycle in/out every 3 s
+  int zcycle = ((now - sleep_started_ms) % 3000);
+  int rise = zcycle / 80;  // up to ~37 px rise over 3 s
+  if (zcycle < 2400) {
+    face_buffer.setTextColor(FEATURE_COLOR);
+    face_buffer.setTextSize(3);
+    face_buffer.setCursor(250, 50 - rise);
+    face_buffer.print("z");
+    face_buffer.setTextSize(2);
+    face_buffer.setCursor(275, 70 - rise);
+    face_buffer.print("Z");
+  }
+
+  face_buffer.pushSprite(&M5StackChan.Display(), 0, 0);
+}
+
+// === Triple-tap detection -> sleep ===
+unsigned long recent_taps[3] = {0, 0, 0};
+int tap_idx = 0;
+
+bool record_tap_and_check_triple() {
+  unsigned long now = millis();
+  tap_idx = (tap_idx + 1) % 3;
+  recent_taps[tap_idx] = now;
+  // Triple = all three slots populated AND oldest within 1.2 s
+  if (recent_taps[0] && recent_taps[1] && recent_taps[2]) {
+    unsigned long oldest = recent_taps[0];
+    for (int i = 1; i < 3; i++) if (recent_taps[i] < oldest) oldest = recent_taps[i];
+    if (now - oldest < 1200) {
+      // Triple tap! Clear so we don't double-fire.
+      for (int i = 0; i < 3; i++) recent_taps[i] = 0;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Visual debug -- shown in the corner of the screen when a power-button
+// event fires, so we can tell whether the button is registering at all.
+extern const char* pwr_debug_label;
+extern unsigned long pwr_debug_until;
+
+void handle_power_button() {
+  // Confirmed: CoreS3's PMIC swallows short presses, only wasHold() registers.
+  // So we use wasHold() for sleep toggle, and pressedFor(3000) for deep sleep.
+  if (M5.BtnPWR.wasHold()) {
+    pwr_debug_label = "PWR";
+    pwr_debug_until = millis() + 1200;
+    if (sleeping) exit_sleep();
+    else          enter_sleep();
+  }
+  if (M5.BtnPWR.pressedFor(3000)) {
+    pwr_debug_label = "DEEP";
+    pwr_debug_until = millis() + 1200;
+    enter_sleep();
+    delay(300);
+    esp_deep_sleep_start();
+  }
+}
+
+// === Phase 9b: Wi-Fi provisioning ===
+// On boot, try saved credentials. If none, or if connecting fails, enter
+// setup mode: start an open AP called "BMO-Setup" with a captive portal
+// that serves a credential-entry form. On submit, save to NVS and reboot.
+// Once connected in STA mode, also serve a status page at http://bmo.local/
+// with a "Forget Wi-Fi" button for re-provisioning.
+
+WebServer http_server(80);
+DNSServer dns_server;
+Preferences wifi_prefs;
+bool wifi_setup_mode = false;
+String wifi_connected_ssid = "";
+
+const char* SETUP_AP_NAME = "BMO-Setup";
+const char* SETUP_AP_PASS = "letsbmo!";  // 8+ chars (WPA2 minimum)
+
+const char* SETUP_PAGE_HTML = R"HTML(<!DOCTYPE html><html>
+<head>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>BMO Setup</title>
+<style>
+body { font-family: -apple-system, sans-serif; max-width: 420px; margin: 2em auto;
+       padding: 0 1em; background: #adf2dc; color: #1a4d3c; }
+h1 { font-size: 2em; }
+input, button { width: 100%; padding: 12px; margin: 6px 0; font-size: 1em;
+                box-sizing: border-box; border-radius: 8px; border: 1px solid #1a4d3c; }
+button { background: #1a4d3c; color: white; border: none; font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>Hi! I'm BMO.</h1>
+<p>Pick a Wi-Fi to connect me to.</p>
+<form action='/save' method='POST'>
+  <input type='text' name='ssid' placeholder='Wi-Fi name' required autofocus>
+  <input type='password' name='pass' placeholder='Password'>
+  <button type='submit'>Connect BMO</button>
+</form>
+</body></html>)HTML";
+
+void show_wifi_setup_screen() {
+  face_buffer.fillScreen(mood_to_color(mood));
+  face_buffer.setTextColor(FEATURE_COLOR);
+
+  face_buffer.setTextSize(2);
+  face_buffer.setCursor(20, 8);   face_buffer.print("Hi! I'm BMO.");
+  face_buffer.setCursor(20, 35);  face_buffer.print("Setup my wifi:");
+
+  face_buffer.setTextSize(1);
+  face_buffer.setCursor(20, 70);  face_buffer.print("1. Join Wi-Fi:");
+  face_buffer.setTextSize(2);
+  face_buffer.setCursor(40, 85);  face_buffer.print("BMO-Setup");
+  face_buffer.setTextSize(1);
+  face_buffer.setCursor(40, 110); face_buffer.print("password: letsbmo!");
+
+  face_buffer.setCursor(20, 135); face_buffer.print("2. Open in browser:");
+  face_buffer.setTextSize(2);
+  face_buffer.setCursor(40, 150); face_buffer.print("192.168.4.1");
+
+  // Tiny on-screen diagnostic so we can see if a client actually joined
+  face_buffer.setTextSize(1);
+  face_buffer.setCursor(20, 185);
+  int n = WiFi.softAPgetStationNum();
+  face_buffer.printf("Clients connected: %d", n);
+
+  face_buffer.pushSprite(&M5StackChan.Display(), 0, 0);
+}
+
+void show_wifi_connecting_screen(const String& ssid) {
+  face_buffer.fillScreen(mood_to_color(mood));
+  face_buffer.setTextColor(FEATURE_COLOR);
+  face_buffer.setTextSize(2);
+  face_buffer.setCursor(20, 50);  face_buffer.print("Connecting...");
+  face_buffer.setCursor(20, 90);  face_buffer.print(ssid);
+  face_buffer.pushSprite(&M5StackChan.Display(), 0, 0);
+}
+
+void send_status_page() {
+  String html = "<!DOCTYPE html><html><head>"
+                "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+                "<title>BMO Status</title>"
+                "<style>body{font-family:-apple-system,sans-serif;max-width:420px;"
+                "margin:2em auto;padding:0 1em;background:#adf2dc;color:#1a4d3c;}"
+                "button{width:100%;padding:12px;font-size:1em;background:#1a4d3c;"
+                "color:white;border:none;border-radius:8px;font-weight:bold;}</style>"
+                "</head><body><h1>BMO is online.</h1>";
+  html += "<p>Wi-Fi: <b>" + wifi_connected_ssid + "</b></p>";
+  html += "<p>IP: <b>" + WiFi.localIP().toString() + "</b></p>";
+  html += "<form action='/forget' method='POST'>"
+          "<button type='submit'>Forget Wi-Fi (re-setup)</button></form>";
+  html += "</body></html>";
+  http_server.send(200, "text/html", html);
+}
+
+void register_setup_routes() {
+  http_server.on("/", []() {
+    http_server.send(200, "text/html", SETUP_PAGE_HTML);
+  });
+  // Captive-portal probes most phones make -- send them to /
+  http_server.on("/generate_204", []() { http_server.send(200, "text/html", SETUP_PAGE_HTML); });
+  http_server.on("/hotspot-detect.html", []() { http_server.send(200, "text/html", SETUP_PAGE_HTML); });
+  http_server.onNotFound([]() {
+    http_server.sendHeader("Location", "http://192.168.4.1/", true);
+    http_server.send(302, "text/plain", "");
+  });
+  http_server.on("/save", HTTP_POST, []() {
+    String ssid = http_server.arg("ssid");
+    String pass = http_server.arg("pass");
+    if (ssid.length() == 0) {
+      http_server.send(400, "text/plain", "SSID required");
+      return;
+    }
+    wifi_prefs.begin("bmo_wifi", false);
+    wifi_prefs.putString("ssid", ssid);
+    wifi_prefs.putString("pass", pass);
+    wifi_prefs.end();
+    http_server.send(200, "text/html",
+      "<h1>Saved! BMO is restarting.</h1>"
+      "<p>I'll connect to your Wi-Fi in a moment.</p>");
+    delay(800);
+    ESP.restart();
+  });
+}
+
+void register_status_routes() {
+  http_server.on("/", []() { send_status_page(); });
+  http_server.on("/forget", HTTP_POST, []() {
+    wifi_prefs.begin("bmo_wifi", false);
+    wifi_prefs.clear();
+    wifi_prefs.end();
+    http_server.send(200, "text/html",
+      "<h1>Wi-Fi forgotten.</h1><p>BMO is restarting into setup mode.</p>");
+    delay(800);
+    ESP.restart();
+  });
+}
+
+void start_wifi_setup_mode() {
+  wifi_setup_mode = true;
+  WiFi.mode(WIFI_AP);
+  // Explicit AP IP config so 192.168.4.1 is reliable
+  WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
+  // WPA2 password so iPhones/Androids don't auto-disconnect from a no-internet open AP
+  WiFi.softAP(SETUP_AP_NAME, SETUP_AP_PASS);
+  delay(100);
+  dns_server.start(53, "*", IPAddress(192, 168, 4, 1));  // captive-portal DNS
+  register_setup_routes();
+  http_server.begin();
+  show_wifi_setup_screen();
+}
+
+void wifi_init() {
+  wifi_prefs.begin("bmo_wifi", true);
+  String saved_ssid = wifi_prefs.getString("ssid", "");
+  String saved_pass = wifi_prefs.getString("pass", "");
+  wifi_prefs.end();
+
+  if (saved_ssid.length() == 0) {
+    start_wifi_setup_mode();
+    return;
+  }
+
+  show_wifi_connecting_screen(saved_ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(saved_ssid.c_str(), saved_pass.c_str());
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(200);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifi_connected_ssid = saved_ssid;
+    if (MDNS.begin("bmo")) MDNS.addService("http", "tcp", 80);
+    register_status_routes();
+    http_server.begin();
+  } else {
+    start_wifi_setup_mode();
+  }
+}
+
+void draw_wifi_status_indicator() {
+  // Tiny indicator in the top-left of the face, only when connected.
+  if (wifi_setup_mode || wifi_connected_ssid.length() == 0) return;
+  face_buffer.setTextColor(FEATURE_COLOR);
+  face_buffer.setTextSize(1);
+  face_buffer.setCursor(2, 2);
+  face_buffer.print("wifi");
+}
+
 // === Setup and loop ===
 
 const char* current_idle_label = nullptr;
@@ -539,6 +1098,12 @@ EyeState face_override_eye = EyeState::NORMAL;
 MouthShape face_override_mouth = MouthShape::NEUTRAL;
 unsigned long face_override_until = 0;
 
+// Phase 9a additions
+bool show_pink_cheeks = false;
+unsigned long pink_cheeks_until = 0;
+const char* pwr_debug_label = nullptr;
+unsigned long pwr_debug_until = 0;
+
 unsigned long last_tick_ms   = 0;
 unsigned long last_render_ms = 0;
 unsigned long next_blink_at  = 0;
@@ -549,25 +1114,66 @@ void setup() {
   M5StackChan.begin();
   M5.Speaker.setVolume(128);
   M5StackChan.Motion.goHome();
-  delay(800);
-  // Quiet boot sound
-  M5.Speaker.tone(523, 60); delay(65);
-  M5.Speaker.tone(784, 80); delay(85);
+  delay(500);
 
   face_buffer.setPsram(true);
   face_buffer.setColorDepth(16);
   face_buffer.createSprite(320, 240);
+
+  // Wi-Fi before the boot chime so the screen can show setup instructions
+  // immediately if needed (no faux-boot when we're in setup mode).
+  wifi_init();
+
+  // Quiet boot sound only once we're past wifi (or in setup mode anyway)
+  M5.Speaker.tone(523, 60); delay(65);
+  M5.Speaker.tone(784, 80); delay(85);
 
   randomSeed(esp_random());
   unsigned long now = millis();
   last_tick_ms        = now;
   last_interaction_ms = now;
   next_blink_at       = now + 2000;
-  draw_face(false);
+  if (!wifi_setup_mode) draw_face(false);
 }
 
 void loop() {
   M5StackChan.update();
+  M5.update();
+
+  // === Wi-Fi setup-mode branch: serve captive portal, hold setup screen ===
+  if (wifi_setup_mode) {
+    dns_server.processNextRequest();
+    http_server.handleClient();
+    if (millis() - last_render_ms > 1000) {
+      show_wifi_setup_screen();
+      last_render_ms = millis();
+    }
+    delay(20);
+    return;
+  }
+
+  // STA mode -- handle status-page requests in the background
+  http_server.handleClient();
+
+  handle_power_button();
+
+  // === Sleep branch: render breathing-Zz face, wake on tap. ===
+  if (sleeping) {
+    auto& ts_sleep = M5StackChan.TouchSensor;
+    if (ts_sleep.wasClicked()) {
+      exit_sleep();
+      // Don't count the wake-tap as a pet -- fall through to normal loop next iteration
+      delay(20);
+      return;
+    }
+    unsigned long now = millis();
+    if (now - last_render_ms > 80) {
+      draw_sleep_face();
+      last_render_ms = now;
+    }
+    delay(40);
+    return;
+  }
 
   unsigned long now = millis();
   float dt = (now - last_tick_ms) / 1000.0f;
@@ -582,22 +1188,30 @@ void loop() {
   bool currently_blinking = (now < blink_until);
   bool blink_changed = (currently_blinking != was_blinking);
 
-  // Touch = mood nudge + quiet-timer reset
-  if (M5StackChan.TouchSensor.wasPressed()) {
-    events[next_event_index].apply(mood);
-    next_event_index = (next_event_index + 1) % event_count;
-    M5.Speaker.tone(1047, 40);
-    last_interaction_ms = now;
-    draw_face(currently_blinking);
-    last_render_ms = now;
-    was_blinking = currently_blinking;
+  // Touch sensor: click = pet (unless 3rd of a triple, then sleep).
+  // Swipe forward = excited, swipe back = calm.
+  auto& ts = M5StackChan.TouchSensor;
+  if (ts.wasClicked()) {
+    if (record_tap_and_check_triple()) {
+      enter_sleep();
+    } else {
+      on_pet_click();
+    }
   }
+  if (ts.wasSwipedForward())  on_swipe_forward();
+  if (ts.wasSwipedBackward()) on_swipe_backward();
+
+  // Shake -> dizzy gesture (checks IMU, fires the gesture if shaken)
+  check_shake();
 
   if (blink_changed || (now - last_render_ms > 200)) {
     draw_face(currently_blinking);
     last_render_ms = now;
     was_blinking = currently_blinking;
   }
+
+  // LED breathing pulse at mood color
+  update_leds();
 
   // Subtle "alive" layer between full behaviors, plus full-behavior firings.
   maybe_fire_micro();

@@ -6,25 +6,19 @@ Newest entries on top. After every working session, append a new block: what we 
 
 ## NEXT SESSION — RESUME HERE
 
-> Pinned section. Read this first when you come back. Last updated 2026-05-19, end of session that built Phase 8 (idle behavior loop).
+> Pinned section. Read this first when you come back. Last updated 2026-05-19, end of session that built Phase 9a (local hardware features) + Phase 9b (Wi-Fi provisioning).
 
 ### Where we are (one paragraph)
 
-Thirteen commits in git, latest after this session covers Phase 8. The robot has: factory firmware safely backed up (`backup/factory-firmware-2026-05-18.bin` + RESTORE.md), a 10-gesture body language vocabulary (`firmware/GestureLab/`), a 9-sound procedural chiptune voice (in GestureLab), a mood state machine with decay (`firmware/MoodLab/`), a drawn BMO face with 6 eye states + 5 mouth shapes, and **autonomous idle behaviors** (`firmware/IdleLab/`) — quiet timer fires weighted-random behaviors every 5–20s, plus micro-fidgets every 2.5–5.5s for continuous "alive" motion. IdleLab v5 is what's on the chip and Amber called it "delightful."
+Project is well past the original brief's Phase 8. The robot now has: factory firmware safely backed up, 10-gesture body language vocabulary, 9-sound chiptune voice, mood state machine with decay, drawn BMO face with **8 eye states** (BLINK, SLEEPY, NORMAL, WIDE, CONTENT, ASLEEP, SWIRL, HEART) and **5 mouth shapes** (SMILE, NEUTRAL, FROWN, OPEN, GRIN), autonomous idle behaviors + micro-fidgets, **12 RGB LEDs with breathing pulse + per-behavior override**, **IMU shake → dizzy gesture** (swirl eyes + pink cheeks + LED flash), **touch reactions** (pet click → heart eyes + grin, swipe forward → excited, swipe back → calming), **triple-tap to sleep**, **sleep mode with Zz animation + breathing mouth + dim screen**, **power-button hold for sleep / long-hold for deep-sleep**, and **Wi-Fi provisioning with AP setup + captive portal + status page at `http://bmo.local/`**. Robot is connected to home Wi-Fi at 192.168.50.185 (status: 2026-05-19).
 
 ### First three things to do when resuming
 
-1. **Re-orient.** Read `notes/project-brief.md` (the original goal), this resume section, and the most recent chronological log entry below. ~5 min.
-2. **Verify the toolchain still works.** Plug the robot in. Run `ls /dev/cu.*` — note the new port name (trailing digits can change between sessions). Re-upload IdleLab to confirm flow:
-   ```
-   CLI="/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli"
-   cd ~/stackchan-bmo
-   "$CLI" compile --fqbn m5stack:esp32:m5stack_cores3 firmware/IdleLab
-   "$CLI" upload  --fqbn m5stack:esp32:m5stack_cores3 --port /dev/cu.usbmodemXXXX firmware/IdleLab
-   ```
-3. **Begin Phase 9 prep.** Make the four architecture decisions below before writing any networking code. They're more important than another sketch iteration.
+1. **Re-orient.** Read `notes/project-brief.md` + this section + most recent chronological log entry. ~5 min.
+2. **Verify connectivity.** Plug robot in, watch it boot. Should connect to home Wi-Fi automatically, show "wifi" indicator top-left. Run `arp -a | grep bmo` or open `http://bmo.local/` to confirm reachable.
+3. **Begin Phase 9c — Host machine setup.** This is the architecture-decision phase: pick a host (Pi 5, Mac mini, spare laptop), install Whisper.cpp + Piper + Python + a small HTTP service, get an Anthropic API key. After 9c, the robot has a brain it can talk to.
 
-### Phase 9 — decide architecture BEFORE writing networking code
+### Phase 9 — Claude API path locked. Remaining phases:
 
 These are flagged from earlier in the project but not resolved. Decide before Phase 9 begins.
 
@@ -292,6 +286,53 @@ The original brief is preserved verbatim in `project-brief.md`. README now refle
   - Low energy → more sleepy / slow gestures.
   - High valence → more bouncy / happy ones.
 - The brief explicitly says: **"Spend real time tuning weights and behaviors here."** This is where the tune-over-ship rule earns its keep.
+
+---
+
+## 2026-05-19 (Phase 9a) — Local hardware features (LEDs, IMU, touch, sleep, expressions)
+
+**Architecture decision (banked):** Phase 9 (conversation) will use **Claude Sonnet 4.5 via the Anthropic API** as the brain, with **local Pi 5 or Mac mini** running Whisper.cpp (STT) + Piper (TTS) + a small HTTP service + memory store. Local LLM was considered (Qwen 2.5 32B on Mac mini) but the user's wishlist (weather/stocks/messages/calendar/search/vision tool calling) all require cloud APIs anyway, and Claude's tool-calling quality is meaningfully better than any local model's. Amber agreed.
+
+**Did in Phase 9a (across 3 iteration rounds):**
+
+- **LEDs**: 12 RGB LEDs do a continuous breathing pulse at the mood color, ~3 s cycle. `set_led_override(r,g,b,ms,flash)` lets behaviors override briefly (pet → pink pulse, dizzy → flashing red).
+- **IMU shake → dizzy gesture**: 30 Hz accelerometer sampling, 3+ peaks > 1.7 g in 1.5 s triggers dizzy. Face shows **SWIRL eyes** (off-center concentric rings) + **OPEN mouth** + **pink cheeks**, LEDs flash hot pink, head wobbles with decaying amplitude, descending wobble tones. Mood gets arousal+ / energy- / valence- nudge.
+- **Touch reactions** (replacing the mood-event-cycling tap UX from MoodLab):
+  - Click = pet → **HEART eyes (deep red, 50% bigger than v1)** + GRIN + soft pink LED pulse + valence nudge.
+  - Swipe forward = excited "yes!" → WIDE eyes + GRIN + 3-note ascending chirp + big mood boost.
+  - Swipe backward = calming pet → CONTENT eyes + SMILE + 2-note descending + arousal drops, valence rises.
+- **Triple-tap sleep**: three taps within 1.2 s puts the robot to sleep.
+- **Sleep mode**: dim screen (brightness 30/255), ASLEEP eyes, mouth gently breathes (4 s cycle), "Zz" letters drift upward and recycle, LEDs off. Wake on single tap.
+- **Power button**: CoreS3's PMIC swallows short presses, only `wasHold()` registers. Bound `wasHold()` to sleep toggle, `pressedFor(3000)` to ESP32 deep sleep. Confirmed working.
+- **Two new face states added**: `EyeState::SWIRL` (dizzy concentric pattern) and `EyeState::HEART` (deep red filled heart, ~14×16 px).
+
+**Feedback rounds (each shipped a tighter version):**
+- v1: features functional but Amber: "pet too subtle, want heart eyes; dizzy too tame, want swirls + pink cheeks; power button only works on hold; want triple-tap sleep."
+- v2: added swirl + heart eyes + cheek blush + LED overrides + button-on-click attempt. Amber: "hearts too light, 50% bigger and darker red; same for swirl+cheeks; power only registers on hold."
+- v3 (shipped): hearts darker red 200/30/50 + 50% bigger, swirl 50% bigger, cheeks 50% bigger, button on hold not click, triple-tap sleep with Zz animation. Amber liked it.
+
+---
+
+## 2026-05-19 (Phase 9b) — Wi-Fi provisioning with AP setup + captive portal
+
+**Did:**
+
+- On boot, robot checks NVS for saved Wi-Fi credentials. If found, attempts STA mode connection with 15 s timeout. If success: starts mDNS as `bmo.local`, opens a small HTTP server on port 80 with a status page + "Forget Wi-Fi" button.
+- If no saved creds OR connect fails: enters **setup mode** — starts an AP called `BMO-Setup` (WPA2, password `letsbmo!`), runs a DNS server that captive-portals all requests to 192.168.4.1, serves a tiny BMO-themed credentials form.
+- After user submits creds on the form, saves to NVS (`Preferences` lib, namespace `bmo_wifi`), calls `ESP.restart()`. Robot reboots and connects with the new creds.
+- Tiny `wifi` text in top-left of normal face = connected. `Clients connected: N` shown on setup screen = how many devices joined the AP.
+
+**Trip wires hit and resolved:**
+
+- v1 used an **open** AP. Amber: "I connected to BMO-Setup and it bounced me back." Cause: iOS/Mac auto-disconnect from open networks with no internet. Fix: WPA2 password `letsbmo!` (8 chars, meets WPA2 min).
+- Also added explicit `WiFi.softAPConfig(192.168.4.1, ...)` so the AP IP is reliable.
+- Setup screen now shows live client-count (`WiFi.softAPgetStationNum()`) for diagnostic clarity.
+
+**Amber on Mac:** joined `BMO-Setup` with password, opened `http://192.168.4.1`, entered home Wi-Fi credentials, robot saved and rebooted into STA mode. Connected at **192.168.50.185**, reachable via `http://bmo.local/`.
+
+**UX note for the long term**: Amber pushed back on the "join BMO-Setup to configure" flow as feeling odd. She agreed to do it once on Mac (which worked) and **the permanent fix lives in Phase 9c-9d (camera): Wi-Fi credentials via QR code scanning, so the AP setup becomes invisible / fallback-only.** The current AP code stays as the fallback path even after QR setup is built.
+
+**Next: Phase 9c — Host machine setup.** Pick hardware (Pi 5 / Mac mini / spare always-on box), install Whisper.cpp + Piper + Python HTTP service, get Anthropic API key. Architecture decision recap: Claude Sonnet 4.5 for the brain, local for audio I/O + memory + tool execution.
 
 ---
 
