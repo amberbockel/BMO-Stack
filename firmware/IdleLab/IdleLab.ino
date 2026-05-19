@@ -897,6 +897,158 @@ void handle_power_button() {
   }
 }
 
+// === Phase 9c: Audio capture and playback ===
+// Foundation for Phase 9d (cloud STT/LLM). The HTTP handler just sets a
+// flag; the actual record-and-playback runs in the main loop context,
+// where blocking-for-seconds is safe. Each step writes a diagnostic
+// label to the screen so we can see exactly where it stops if it stops.
+
+const int    AUDIO_SAMPLE_RATE     = 16000;
+const int    AUDIO_RECORD_SECONDS  = 4;  // +1 s buffer so warmup doesn't eat speech
+const size_t AUDIO_BUFFER_SAMPLES  = AUDIO_SAMPLE_RATE * AUDIO_RECORD_SECONDS;
+int16_t*     audio_buffer          = nullptr;
+volatile bool audio_test_pending   = false;
+volatile bool tone_test_pending    = false;
+char audio_diag_label[40] = {0};
+
+void init_audio_buffer() {
+  audio_buffer = (int16_t*)heap_caps_malloc(
+    AUDIO_BUFFER_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+}
+
+void run_tone_only_test() {
+  // Isolates the speaker -- never touches the mic. If a tone plays from
+  // this, the speaker is fine when mic was never invoked.
+  set_led_override(80, 220, 80, 2500, false);
+  face_override_active = true;
+  face_override_eye    = EyeState::NORMAL;
+  face_override_mouth  = MouthShape::SMILE;
+  face_override_until  = millis() + 2500;
+  current_idle_label   = "tone test (mic untouched)";
+  idle_label_until     = millis() + 2500;
+  draw_face(false);
+  M5.Speaker.setVolume(255);
+  M5.Speaker.tone(440,  300); delay(330);
+  M5.Speaker.tone(659,  300); delay(330);
+  M5.Speaker.tone(880,  300); delay(330);
+  M5.Speaker.tone(1320, 400); delay(420);
+}
+
+void set_audio_diag(const char* msg, int ms = 2500) {
+  strncpy(audio_diag_label, msg, sizeof(audio_diag_label) - 1);
+  current_idle_label = audio_diag_label;
+  idle_label_until   = millis() + ms;
+  draw_face(false);
+}
+
+void run_audio_test_now() {
+  if (!audio_buffer) {
+    set_audio_diag("audio buf NULL", 3000);
+    return;
+  }
+
+  // STEP 1: "Get ready" -- speaker plays a 3-note ascending cue.
+  // User knows something is coming; mic is NOT recording yet.
+  face_override_active = true;
+  face_override_eye    = EyeState::NORMAL;
+  face_override_mouth  = MouthShape::SMILE;
+  face_override_until  = millis() + 1200;
+  set_led_override(255, 180, 0, 1200, false);
+  set_audio_diag("get ready...", 1200);
+  M5.Speaker.setVolume(255);
+  M5.Speaker.tone(523, 120); delay(150);
+  M5.Speaker.tone(659, 120); delay(150);
+  M5.Speaker.tone(880, 200); delay(280);
+
+  // STEP 2: Switch to mic and start recording
+  if (!M5.Mic.begin()) {
+    set_audio_diag("mic.begin FAILED", 3500);
+    return;
+  }
+  if (!M5.Mic.record(audio_buffer, AUDIO_BUFFER_SAMPLES, AUDIO_SAMPLE_RATE)) {
+    set_audio_diag("mic.record FAILED", 3500);
+    M5.Mic.end();
+    return;
+  }
+
+  // STEP 3: 400 ms mic warmup BEFORE we tell the user to speak.
+  // Any "first part cut off" is buffered by the longer record duration.
+  delay(400);
+
+  // STEP 4: Bright green "SPEAK NOW!" cue -- user starts speaking now.
+  face_override_active = true;
+  face_override_eye    = EyeState::WIDE;
+  face_override_mouth  = MouthShape::OPEN;
+  face_override_until  = millis() + AUDIO_RECORD_SECONDS * 1000 + 200;
+  set_led_override(0, 255, 0, AUDIO_RECORD_SECONDS * 1000, false);  // bright green
+  set_audio_diag("SPEAK NOW!", AUDIO_RECORD_SECONDS * 1000);
+
+  // Wait for the rest of the record window
+  unsigned long t0 = millis();
+  while (M5.Mic.isRecording() && (millis() - t0) < (AUDIO_RECORD_SECONDS * 1000 + 1000)) {
+    delay(50);
+  }
+  M5.Mic.end();
+
+  // Check we actually captured anything by finding the peak amplitude
+  int peak = 0;
+  for (size_t i = 0; i < AUDIO_BUFFER_SAMPLES; i++) {
+    int v = audio_buffer[i] < 0 ? -audio_buffer[i] : audio_buffer[i];
+    if (v > peak) peak = v;
+  }
+
+  // Step 2: thinking (HELD 5 seconds so user can read the peak value)
+  face_override_active = true;
+  face_override_eye    = EyeState::NORMAL;
+  face_override_mouth  = MouthShape::NEUTRAL;
+  face_override_until  = millis() + 5000;
+  set_led_override(255, 180, 0, 5000, false);
+  snprintf(audio_diag_label, sizeof(audio_diag_label), "peak=%d", peak);
+  current_idle_label = audio_diag_label;
+  idle_label_until   = millis() + 5000;
+  draw_face(false);
+  delay(5000);
+
+  // Step 3: aggressively reset speaker -- end existing config, delay, re-init.
+  // mic.end() can leave I2S in a half-initialized state on the CoreS3.
+  delay(300);
+  M5.Speaker.end();
+  delay(200);
+  if (!M5.Speaker.begin()) {
+    set_audio_diag("spk.begin FAILED", 3500);
+    return;
+  }
+  M5.Speaker.setVolume(255);  // max
+  delay(100);
+
+  // VERIFICATION TONE: if you hear this beep, speaker works.
+  // If you don't hear it, speaker re-init failed silently.
+  face_override_active = true;
+  face_override_eye    = EyeState::NORMAL;
+  face_override_mouth  = MouthShape::SMILE;
+  face_override_until  = millis() + 1000;
+  set_led_override(80, 220, 80, 1000, false);  // green for "speaker check"
+  set_audio_diag("verify tone", 1000);
+  M5.Speaker.tone(880, 300); delay(350);
+  M5.Speaker.tone(1320, 300); delay(350);
+
+  // Step 4: actual playback of the recorded buffer
+  face_override_until  = millis() + AUDIO_RECORD_SECONDS * 1000 + 400;
+  set_led_override(200, 100, 220, AUDIO_RECORD_SECONDS * 1000, false);
+  set_audio_diag("playing back", AUDIO_RECORD_SECONDS * 1000);
+
+  if (!M5.Speaker.playRaw(audio_buffer, AUDIO_BUFFER_SAMPLES, AUDIO_SAMPLE_RATE, false, 1, -1)) {
+    set_audio_diag("spk.playRaw FAILED", 3500);
+    return;
+  }
+
+  t0 = millis();
+  while (M5.Speaker.isPlaying() && (millis() - t0) < (AUDIO_RECORD_SECONDS * 1000 + 1000)) {
+    delay(50);
+  }
+  set_audio_diag("done", 2500);
+}
+
 // === Phase 9b: Wi-Fi provisioning ===
 // On boot, try saved credentials. If none, or if connecting fails, enter
 // setup mode: start an open AP called "BMO-Setup" with a captive portal
@@ -980,11 +1132,21 @@ void send_status_page() {
                 "<style>body{font-family:-apple-system,sans-serif;max-width:420px;"
                 "margin:2em auto;padding:0 1em;background:#adf2dc;color:#1a4d3c;}"
                 "button{width:100%;padding:12px;font-size:1em;background:#1a4d3c;"
-                "color:white;border:none;border-radius:8px;font-weight:bold;}</style>"
+                "color:white;border:none;border-radius:8px;font-weight:bold;"
+                "margin-top:8px;}</style>"
                 "</head><body><h1>BMO is online.</h1>";
   html += "<p>Wi-Fi: <b>" + wifi_connected_ssid + "</b></p>";
   html += "<p>IP: <b>" + WiFi.localIP().toString() + "</b></p>";
-  html += "<form action='/forget' method='POST'>"
+  html += "<h2>Audio tests</h2>"
+          "<p><b>Tone only:</b> 4 ascending notes via the speaker. Never "
+          "touches the mic. Use this to confirm the speaker works in isolation.</p>"
+          "<form action='/test-tone' method='POST'>"
+          "<button type='submit'>Test Tone Only</button></form>"
+          "<p><b>Mic + speaker:</b> record 3 s then play it back.</p>"
+          "<form action='/test-audio' method='POST'>"
+          "<button type='submit'>Test Mic + Speaker (record + playback)</button></form>";
+  html += "<h2>Settings</h2>"
+          "<form action='/forget' method='POST'>"
           "<button type='submit'>Forget Wi-Fi (re-setup)</button></form>";
   html += "</body></html>";
   http_server.send(200, "text/html", html);
@@ -1030,6 +1192,19 @@ void register_status_routes() {
       "<h1>Wi-Fi forgotten.</h1><p>BMO is restarting into setup mode.</p>");
     delay(800);
     ESP.restart();
+  });
+  http_server.on("/test-audio", HTTP_POST, []() {
+    audio_test_pending = true;
+    http_server.send(200, "text/html",
+      "<h1>BMO is listening for 3 seconds...</h1>"
+      "<p>Then BMO will play it back. Watch BMO's face.</p>"
+      "<p><a href='/'>Back to status</a></p>");
+  });
+  http_server.on("/test-tone", HTTP_POST, []() {
+    tone_test_pending = true;
+    http_server.send(200, "text/html",
+      "<h1>Playing a tone test...</h1>"
+      "<p><a href='/'>Back to status</a></p>");
   });
 }
 
@@ -1119,6 +1294,9 @@ void setup() {
   face_buffer.setPsram(true);
   face_buffer.setColorDepth(16);
   face_buffer.createSprite(320, 240);
+
+  // Phase 9c: pre-allocate the audio capture buffer (in PSRAM)
+  init_audio_buffer();
 
   // Wi-Fi before the boot chime so the screen can show setup instructions
   // immediately if needed (no faux-boot when we're in setup mode).
@@ -1212,6 +1390,16 @@ void loop() {
 
   // LED breathing pulse at mood color
   update_leds();
+
+  // Phase 9c: run audio test if web button queued one
+  if (audio_test_pending) {
+    audio_test_pending = false;
+    run_audio_test_now();
+  }
+  if (tone_test_pending) {
+    tone_test_pending = false;
+    run_tone_only_test();
+  }
 
   // Subtle "alive" layer between full behaviors, plus full-behavior firings.
   maybe_fire_micro();
