@@ -196,6 +196,52 @@ The original brief is preserved verbatim in `project-brief.md`. README now refle
 
 ---
 
+## 2026-05-18 (Phase 7 complete) — mood state machine landed
+
+**Did:**
+- `firmware/MoodLab/MoodLab.ino`: full mood model + visual feedback rig.
+- **Mood model:**
+  - `valence` in [-1, 1], neutral 0.
+  - `arousal` in [0, 1], neutral 0.3.
+  - `energy` in [0, 1], neutral 0.5.
+  - Exponential decay toward neutral via `approach(v, target, rate, dt)`.
+  - Decay half-lives: V=60s, A=30s, E=120s. Moods linger, excitement fades fastest, energy is slowest to recover or drain.
+- **Color mapping:**
+  - BMO teal at neutral (RGB ~55, 200, 170).
+  - Valence shifts hue: positive → warm (+R, +G slight, -B), negative → cool (-R, -G big, +B).
+  - Energy multiplies brightness (0.4 to 1.0).
+  - Arousal **not visible in color yet** — deliberately reserved for Phase 8 (blink rate, idle behavior choice). Better to be honest than fake an arousal effect that doesn't fit.
+- **Six tap-cycle events for tuning:** happy / sad / curious / surprised / tired / cheer_up. Each event nudges some subset of V, A, E by various amounts.
+- Render at ~5 Hz to show real-time decay drift back to neutral.
+- Tested with Amber: first-pass values shipped. ("test looks great.")
+
+**Banked from outside reference (brenpoly/be-more-agent on GitHub):**
+- That project runs on Raspberry Pi 5, not ESP32 — different hardware track, but useful **architecture patterns**:
+  - Ollama for local LLM (validates the local-model path Amber wants for Phase 9).
+  - whisper.cpp for speech-in, piper for speech-out.
+  - Sound taxonomy organized by **conversation state** (greeting / thinking / ack / error) — orthogonal to our **emotion**-keyed sounds. We'll want both eventually.
+  - Face states explicit enum: listening / thinking / speaking / idle / error / warmup.
+  - Memory as simple `chat_memory.json`.
+- None of this changes Phases 7 or 8; informs Phase 9.
+- Also: 101soundboards has a BMO soundboard Amber can use as reference when evaluating our chiptune sounds. I can't listen to audio, but Amber can A/B compare.
+
+**Next: Phase 8 — idle behavior loop ("the BMO core" per the brief).**
+- Quiet-detection timer: track `millis() - last_interaction_ms`. After 15–60s of quiet, fire a behavior.
+- Pool of idle behaviors:
+  - `hum_short` — 4-note chiptune (new — needs sound design)
+  - `look_around` — pan to L, hold, pan to R, hold, home (composes from snap_look / curious_tilt patterns)
+  - `slow_blink` (reuse from gesture lib)
+  - `talk_to_corner` — turn head to corner, hum/babble (new)
+  - `practice_speech` — head moves slightly + chiptune phrases as if rehearsing (new)
+  - Plus weighted random selection of the existing emotion gestures occasionally
+- Mood biases the weight table:
+  - High arousal → more idle behaviors fire (shorter intervals).
+  - Low energy → more sleepy / slow gestures.
+  - High valence → more bouncy / happy ones.
+- The brief explicitly says: **"Spend real time tuning weights and behaviors here."** This is where the tune-over-ship rule earns its keep.
+
+---
+
 ## 2026-05-18 — Phase 0: project setup
 
 **Did:**
