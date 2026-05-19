@@ -242,6 +242,45 @@ The original brief is preserved verbatim in `project-brief.md`. README now refle
 
 ---
 
+## 2026-05-18/19 — Drawn-face expressions in MoodLab (v1 → v6)
+
+**Did:** Added a rendered BMO face on top of the Phase 7 color-driven background. Six iteration rounds, all driven by Amber's visual feedback:
+
+- **v1.** White rounded-rect eyes, line-segment smile/frown, simple circle for open mouth. Read as "a face" but not BMO; visible flicker from per-call SPI fillScreen.
+- **v2.** Eyes black instead of white (BMO is dark-features-on-teal), curves thickened, more pronounced amplitude. Switched to **offscreen LGFX_Sprite in PSRAM** so the whole frame composites in memory and the LCD only sees finished images — eliminated flicker entirely.
+- **v3.** Major proportion correction: eyes shrunk from 46×46 rounded rects to **8-px filled circle dots**, spaced 150 px apart, repositioned. Mouth doubled in size. The pixel real estate for the eyes was wildly too large relative to BMO's actual eye scale.
+- **v4.** Mouth shape upgraded from line segments to filled half-ellipse crescents. Looks like a real curve instead of three pieces of stick.
+- **Bug found.** "Sad" event was nudging valence by -0.35, which cancelled exactly against the +0.35 happy nudge that fired one tap earlier in the cycle. Result: sad face never appeared in the lab, because we kept landing on neutral. Fixed by making sad asymmetrically louder (-0.75) and loosening mouth thresholds to ±0.20.
+- **v5.** Eye-mouth gap closed (eyes y=90, mouth y=130). Added **white "teeth" band** inside the smile crescent — the single most BMO-defining feature. Smile now reads as "open-mouth grin with teeth showing" rather than abstract curve.
+- **v6.** Surprised mouth corrected per a clearer Amber reference. Was a wide-open shock-face with white teeth; should have been small (~32×18), contained, with a **darker shade of the mood color** as interior (not white). Added `darker_mood_color()` helper that runs the same hue/saturation math at 0.6× brightness.
+
+**Eye states** (driven by `compute_eye_state(mood, blinking)`):
+- BLINK: 18×4 horizontal rect — only during the ~150 ms auto-blink window.
+- SLEEPY (energy < 0.3): flat horizontal arc (fillEllipse 9×4, offset down 2 px).
+- NORMAL: 8-px filled circle.
+- WIDE (arousal > 0.7): 10-px filled circle.
+
+**Mouth states** (driven by `compute_mouth(mood)`):
+- OPEN (arousal > 0.85): small dark oval + darker-interior oval. The "oh!" face.
+- SMILE (valence > 0.20): wide dark crescent + white teeth band. The trademark BMO grin.
+- FROWN (valence < -0.20): inverted crescent, no teeth. Kept simple per references — BMO sad faces use motion lines / X-eyes that we deferred to Phase 8 composed gestures.
+- NEUTRAL: 60×4 horizontal rect. Flat resting line.
+
+**Color mapping unchanged from Phase 7 v1:**
+- BMO teal baseline (R=55, G=200, B=170).
+- Valence shifts hue (warm for positive, deep blue for negative).
+- Energy multiplies brightness (0.4× to 1.0×).
+- Arousal — still not directly mapped to color. Drives the WIDE/OPEN states instead.
+
+**Architecture notes for Phase 8:**
+- Each draw_*() function reads from the global `mood`; the gesture system in Phase 8 needs a way to temporarily override the face during composed gestures (e.g. "confused_shake" should briefly show distress-eyes + bow-tie mouth even if mood is neutral). Likely an overlay/expression-stack pattern.
+- The bottom debug strip (`V: A: E: next:`) should be hide-able via a flag when we ship without the tap-cycle lab.
+- Sprite is created once in `setup()` and reused every frame. PSRAM hit, ~153 KB.
+
+**Amber's final note:** "pretty good i'm happy with this." Six rounds was enough.
+
+---
+
 ## 2026-05-18 — Phase 0: project setup
 
 **Did:**
