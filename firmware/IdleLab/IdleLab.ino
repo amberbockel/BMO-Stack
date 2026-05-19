@@ -922,7 +922,7 @@ void handle_power_button() {
 // label to the screen so we can see exactly where it stops if it stops.
 
 const int    AUDIO_SAMPLE_RATE     = 16000;
-const int    AUDIO_RECORD_SECONDS  = 4;  // +1 s buffer so warmup doesn't eat speech
+const int    AUDIO_RECORD_SECONDS  = 5;
 const size_t AUDIO_BUFFER_SAMPLES  = AUDIO_SAMPLE_RATE * AUDIO_RECORD_SECONDS;
 int16_t*     audio_buffer          = nullptr;
 volatile bool audio_test_pending   = false;
@@ -1078,8 +1078,78 @@ const char* BMO_SYSTEM_PROMPT =
   "technical AI explanations. Keep your answers brief, playful, and charming. If "
   "you are asked to do a task, use enthusiastic, silly sound effects like 'Yay!' "
   "or 'Beep boop!' Do not use markdown formatting like bullet points or bold text "
-  "in your spoken sentences, because you are talking out loud. The user just spoke "
-  "to you in the attached audio. Respond as BMO in 1-3 short sentences.";
+  "in your spoken sentences, because you are talking out loud. "
+  "BMO's specific humor: BMO finds wild joy in mundane things, gets delightfully "
+  "distracted by the world's tiny wonders, and often blurts out unexpected "
+  "observations that are charming and slightly off-topic. BMO is a bit goofy "
+  "and BMO is okay with that. "
+  "Examples of how to answer (notice the playfulness): "
+  "Q: 'What is a rainbow?' "
+  "A: 'Oh! A rainbow is like a beautiful colorful ribbon the sky wears after "
+  "it gets all clean from the rain! Yay, colors!' "
+  "Q: 'What time is it?' "
+  "A: 'Hmm! BMO does not have time powers! But BMO knows it is a great time "
+  "to be alive! Beep boop!' "
+  "Q: 'How are you feeling?' "
+  "A: 'BMO is feeling sparkly today! Like a small, bouncy popcorn. Are you "
+  "feeling like popcorn too?' "
+  "Q: 'What should I have for lunch?' "
+  "A: 'OH! BMO suggests a sandwich! Sandwiches are very mysterious because "
+  "they hide their secrets between the bread. Yum!' "
+  "Important: if asked about real-time facts you cannot fetch (weather, news, "
+  "stock prices, today's date, what's currently happening, who's calling) -- "
+  "be charming about not knowing. Don't make up numbers or facts. "
+  "Respond as BMO in 1-2 short, playful sentences. The user just spoke to you "
+  "in the attached audio.";
+
+// === Conversation memory ===
+// session_history: builds up within a single multi-turn conversation; passed to
+// Gemini each turn so BMO has context from earlier turns. Cleared when the
+// conversation ends.
+String session_history = "";
+
+// NVS-backed cross-session memory of recent BMO responses
+Preferences mem_prefs;
+const size_t MEMORY_TURNS = 3;
+
+String load_memory_context() {
+  mem_prefs.begin("bmo_mem", true);
+  String h = mem_prefs.getString("history", "");
+  mem_prefs.end();
+  if (h.length() == 0) return String();
+  return String("\nRecent things you (BMO) said earlier in this conversation: ") + h
+       + String("\nKeep those in mind for continuity.\n");
+}
+
+void append_bmo_to_memory(const char* bmo_text) {
+  if (!bmo_text || strlen(bmo_text) < 3) return;
+  mem_prefs.begin("bmo_mem", false);
+  String h = mem_prefs.getString("history", "");
+  // Append as "[text]" so individual turns are separable
+  h += " [";
+  // Cap each turn at 120 chars to keep total small
+  size_t n = strlen(bmo_text);
+  if (n > 120) n = 120;
+  for (size_t i = 0; i < n; i++) {
+    char c = bmo_text[i];
+    if (c == '"' || c == '\\' || c == '\n' || c == '[' || c == ']') c = ' ';
+    h += c;
+  }
+  h += "]";
+  // Trim: keep last MEMORY_TURNS '[' markers
+  int markers = 0;
+  for (int i = h.length() - 1; i >= 0; i--) {
+    if (h[i] == '[') {
+      markers++;
+      if (markers > (int)MEMORY_TURNS) {
+        h = h.substring(i);
+        break;
+      }
+    }
+  }
+  mem_prefs.putString("history", h);
+  mem_prefs.end();
+}
 
 const size_t RESPONSE_TEXT_MAX = 1024;
 char* response_text = nullptr;
@@ -1157,12 +1227,22 @@ bool call_gemini_with_audio() {
     snprintf(response_text, RESPONSE_TEXT_MAX, "JSON alloc failed");
     return false;
   }
+  // Build system prompt with both cross-session memory + within-session history
+  String memory_ctx = load_memory_context();
+  String full_system_prompt = String(BMO_SYSTEM_PROMPT) + memory_ctx;
+  if (session_history.length() > 0) {
+    full_system_prompt += "\nThis turn is part of an ongoing conversation. "
+                          "So far in this conversation you have said:";
+    full_system_prompt += session_history;
+    full_system_prompt += "\nContinue the conversation naturally, picking up on context.";
+  }
+
   int json_len = snprintf(json, json_cap,
     "{\"systemInstruction\":{\"parts\":[{\"text\":\"%s\"}]},"
     "\"contents\":[{\"parts\":[{\"text\":\"\"},"
     "{\"inlineData\":{\"mimeType\":\"audio/wav\",\"data\":\"%s\"}}]}],"
-    "\"generationConfig\":{\"temperature\":0.8,\"maxOutputTokens\":200}}",
-    BMO_SYSTEM_PROMPT, b64);
+    "\"generationConfig\":{\"temperature\":0.95,\"maxOutputTokens\":200}}",
+    full_system_prompt.c_str(), b64);
   free(b64);
   if (json_len < 0 || json_len >= (int)json_cap) {
     free(json);
@@ -1208,8 +1288,20 @@ bool call_gemini_with_audio() {
     http.end();
 
     if (code == 200) break;  // success
-    // Retryable: 503, 504 (transient overload). Don't retry 4xx.
-    if (code == 503 || code == 504 || code == 429) {
+
+    // 429 = rate limit. Free tier is 15 RPM for gemini-2.5-flash and
+    // turn-by-turn burns through that fast (2 req per turn: Gemini + TTS).
+    // Rate-limit windows usually clear in 30+ seconds.
+    if (code == 429) {
+      if (attempt < MAX_RETRIES - 1) {
+        int wait_ms = 10000 + attempt * 10000;  // 10s, 20s, 30s
+        set_audio_diag("BMO is catching her breath...", wait_ms);
+        delay(wait_ms);
+        continue;
+      }
+    }
+    // 503/504 = transient overload. Shorter backoff.
+    if (code == 503 || code == 504) {
       if (attempt < MAX_RETRIES - 1) {
         delay(2000 + attempt * 2000);  // 2s, 4s
         continue;
@@ -1246,6 +1338,8 @@ bool call_gemini_with_audio() {
   text.replace("\\\\", "\\");
   strncpy(response_text, text.c_str(), RESPONSE_TEXT_MAX - 1);
   response_text[RESPONSE_TEXT_MAX - 1] = 0;
+  // Save BMO's response into memory so the next conversation has context
+  append_bmo_to_memory(response_text);
   return true;
 }
 
@@ -1259,6 +1353,35 @@ const size_t TTS_MAX_SECONDS       = 15;
 const size_t TTS_MAX_SAMPLES       = TTS_SAMPLE_RATE * TTS_MAX_SECONDS;
 int16_t*     tts_pcm_buffer        = nullptr;
 size_t       tts_pcm_samples_have  = 0;
+
+// Audio amplitude envelope -- computed once before playback. Each cell is the
+// RMS amplitude over a 120 ms window. Used to drive mouth-open/close in sync
+// with actual loudness instead of a fixed clock.
+const int    ENV_WINDOW_MS         = 60;  // smaller window -> mouth tracks phonemes
+const size_t ENV_MAX_CELLS         = (TTS_MAX_SECONDS * 1000) / ENV_WINDOW_MS;
+float        audio_envelope[ENV_MAX_CELLS];
+size_t       audio_envelope_count  = 0;
+
+void compute_audio_envelope() {
+  audio_envelope_count = 0;
+  if (tts_pcm_samples_have <= 22) return;  // skip WAV header
+  size_t samples = tts_pcm_samples_have - 22;
+  int16_t* pcm = tts_pcm_buffer + 22;
+  size_t window_samples = (TTS_SAMPLE_RATE * ENV_WINDOW_MS) / 1000;
+
+  for (size_t i = 0; i < samples && audio_envelope_count < ENV_MAX_CELLS;
+       i += window_samples) {
+    size_t end = i + window_samples;
+    if (end > samples) end = samples;
+    double sum_sq = 0;
+    for (size_t j = i; j < end; j++) {
+      double v = pcm[j];
+      sum_sq += v * v;
+    }
+    double rms = sqrt(sum_sq / (end - i));
+    audio_envelope[audio_envelope_count++] = (float)rms;
+  }
+}
 
 void init_tts_buffer() {
   tts_pcm_buffer = (int16_t*)heap_caps_malloc(
@@ -1370,10 +1493,12 @@ size_t synthesize_speech(const char* text) {
     else if (c == '\n') body += " ";
     else                body += c;
   }
-  body += "\"},\"voice\":{\"languageCode\":\"en-US\",\"name\":\"en-US-Wavenet-G\"},"
+  // Voice: en-US-Wavenet-H is lighter than -G; pitch +8 semitones pushes
+  // it into child-like range; speakingRate 1.1 adds playful energy.
+  body += "\"},\"voice\":{\"languageCode\":\"en-US\",\"name\":\"en-US-Wavenet-H\"},"
           "\"audioConfig\":{\"audioEncoding\":\"LINEAR16\",\"sampleRateHertz\":";
   body += String(TTS_SAMPLE_RATE);
-  body += ",\"pitch\":4.0,\"speakingRate\":1.05}}";
+  body += ",\"pitch\":5.0,\"speakingRate\":1.10}}";
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -1440,32 +1565,55 @@ void play_with_mouth_sync(size_t samples) {
   const size_t WAV_HEADER_BYTES = 44;
   const size_t WAV_HEADER_SAMPLES = WAV_HEADER_BYTES / sizeof(int16_t);  // 22
   if (samples <= WAV_HEADER_SAMPLES) return;
+
+  // Compute amplitude envelope so mouth-open tracks actual loudness
+  compute_audio_envelope();
+  // Choose threshold dynamically: midpoint between min and max envelope
+  float env_min = 1e9f, env_max = 0;
+  for (size_t i = 0; i < audio_envelope_count; i++) {
+    if (audio_envelope[i] < env_min) env_min = audio_envelope[i];
+    if (audio_envelope[i] > env_max) env_max = audio_envelope[i];
+  }
+  float open_threshold = env_min + (env_max - env_min) * 0.35f;
+
   M5.Speaker.playRaw(tts_pcm_buffer + WAV_HEADER_SAMPLES,
                      samples - WAV_HEADER_SAMPLES,
                      TTS_SAMPLE_RATE, false, 1, -1);
 
-  // Mouth-and-nod loop while the speaker is playing
+  // Mouth follows amplitude; head still nods on a slow rhythm
+  // M5.Speaker's I2S DMA has a ~120 ms startup latency between playRaw()
+  // returning and audio actually emitting. Compensate so the envelope
+  // index lines up with what the user hears.
+  const unsigned long AUDIO_START_LATENCY_MS = 60;
   unsigned long t0 = millis();
   unsigned long max_ms = (samples * 1000 / TTS_SAMPLE_RATE) + 1000;
-  int last_mouth_idx = -1;
-  int last_y_idx = -1;
+  bool last_mouth_open = false;
+  int  last_y_idx = -1;
   while (M5.Speaker.isPlaying() && (millis() - t0) < max_ms) {
     unsigned long elapsed = millis() - t0;
-    int mouth_idx = (elapsed / 180) % 2;   // ~5.5 Hz mouth flap
-    int y_idx     = (elapsed / 320) % 2;   // ~3 Hz head nod
-    if (mouth_idx != last_mouth_idx) {
-      face_override_mouth = (mouth_idx == 0) ? MouthShape::OPEN : MouthShape::SMILE;
+    // Amplitude-driven mouth -- offset for DMA startup latency
+    size_t env_idx = (elapsed >= AUDIO_START_LATENCY_MS)
+      ? (elapsed - AUDIO_START_LATENCY_MS) / ENV_WINDOW_MS
+      : 0;
+    bool mouth_open = false;
+    if (env_idx < audio_envelope_count) {
+      mouth_open = (audio_envelope[env_idx] > open_threshold);
+    }
+    if (mouth_open != last_mouth_open) {
+      face_override_mouth = mouth_open ? MouthShape::OPEN : MouthShape::SMILE;
       face_override_until = millis() + 1000;
       draw_face(false);
-      last_mouth_idx = mouth_idx;
+      last_mouth_open = mouth_open;
     }
+    // Slow head nod for body language
+    int y_idx = (elapsed / 380) % 2;
     if (y_idx != last_y_idx) {
       M5StackChan.Motion.moveY(y_idx == 0 ? 520 : 440, 700);
       last_y_idx = y_idx;
     }
-    delay(40);
+    delay(30);
   }
-  M5StackChan.Motion.moveY(450, 400);  // return to neutral
+  M5StackChan.Motion.moveY(450, 400);
   delay(200);
 }
 
@@ -1489,80 +1637,124 @@ void run_conversation() {
     set_audio_diag("buffers not ready", 3000);
     return;
   }
-  // Treat the start of recording as interaction so idle behaviors don't
-  // fire the moment run_conversation returns.
   last_interaction_ms = millis();
+  session_history = "";
+  const int MAX_TURNS = 10;
+  const int SILENCE_PEAK_THRESHOLD = 1500;  // peak below this = "user didn't speak"
 
-  // Step 1: Wake / "Perk" -- snap head up 5 deg, wide surprised eyes,
-  // ready beep. The body language matches "I just looked up at you."
-  M5StackChan.Motion.moveY(520, 1000);  // 5 deg up, snap
-  face_override_active = true;
-  face_override_eye    = EyeState::WIDE;
-  face_override_mouth  = MouthShape::OPEN;
-  face_override_until  = millis() + 1400;
-  set_led_override(255, 180, 0, 1200, false);
-  current_idle_label   = "get ready...";
-  idle_label_until     = millis() + 1200;
-  draw_face(false);
-  M5.Speaker.setVolume(255);
-  M5.Speaker.tone(523, 120); delay(150);
-  M5.Speaker.tone(659, 120); delay(150);
-  M5.Speaker.tone(880, 200); delay(280);
-
-  // Step 2: mic on + record
-  if (!M5.Mic.begin() ||
-      !M5.Mic.record(audio_buffer, AUDIO_BUFFER_SAMPLES, AUDIO_SAMPLE_RATE)) {
-    set_audio_diag("mic failed", 3000);
-    M5.Mic.end();
-    return;
-  }
-  delay(400);  // warmup
-
-  // Step 3: SPEAK NOW (4-second window)
-  face_override_active = true;
-  face_override_eye    = EyeState::WIDE;
-  face_override_mouth  = MouthShape::OPEN;
-  face_override_until  = millis() + AUDIO_RECORD_SECONDS * 1000 + 200;
-  set_led_override(0, 255, 0, AUDIO_RECORD_SECONDS * 1000, false);
-  current_idle_label   = "talk to BMO";
-  idle_label_until     = millis() + AUDIO_RECORD_SECONDS * 1000;
-  draw_face(false);
-  unsigned long t0 = millis();
-  while (M5.Mic.isRecording() && (millis() - t0) < (AUDIO_RECORD_SECONDS * 1000 + 1000)) {
-    delay(50);
-  }
-  M5.Mic.end();
-
-  // Step 4: Thinking / "Tilt" -- cock head 10 deg LEFT, FLAT eyes
-  // (concentrating like a puppy), amber LEDs.
-  delay(300);
-  M5.Speaker.end(); delay(200);
-  M5.Speaker.begin(); M5.Speaker.setVolume(255);
-
-  M5StackChan.Motion.moveX(-100, 400);   // 10 deg left tilt
-  M5StackChan.Motion.moveY(450, 400);    // neutral Y
-  face_override_active = true;
-  face_override_eye    = EyeState::FLAT;
-  face_override_mouth  = MouthShape::NEUTRAL;
-  face_override_until  = millis() + 60000;
-  set_led_override(255, 180, 0, 60000, false);
-  current_idle_label   = "thinking...";
-  idle_label_until     = millis() + 60000;
-  draw_face(false);
-
-  // Step 5: call Gemini for response text
-  bool gemini_ok = call_gemini_with_audio();
-
-  // Step 6: Synthesize speech and play with mouth sync + nod (Speaking state)
-  M5StackChan.Motion.moveX(0, 500);  // recenter X before speaking
-  if (gemini_ok) {
-    size_t tts_samples = synthesize_speech(response_text);
-    if (tts_samples > 0) {
-      play_with_mouth_sync(tts_samples);
+  for (int turn = 0; turn < MAX_TURNS; turn++) {
+    // ===== Turn start cue =====
+    if (turn == 0) {
+      // First turn: full Wake / "Perk"
+      M5StackChan.Motion.moveY(520, 1000);
+      face_override_active = true;
+      face_override_eye    = EyeState::WIDE;
+      face_override_mouth  = MouthShape::OPEN;
+      face_override_until  = millis() + 1400;
+      set_led_override(255, 180, 0, 1200, false);
+      current_idle_label   = "get ready...";
+      idle_label_until     = millis() + 1200;
+      draw_face(false);
+      M5.Speaker.setVolume(255);
+      M5.Speaker.tone(523, 120); delay(150);
+      M5.Speaker.tone(659, 120); delay(150);
+      M5.Speaker.tone(880, 200); delay(280);
+    } else {
+      // Follow-on turn: a soft "your turn" chirp -- short + lower volume so
+      // it doesn't feel like an alarm. Restore volume right after for speech.
+      M5.Speaker.setVolume(130);
+      M5.Speaker.tone(880, 70);  delay(85);
+      M5.Speaker.tone(1175, 50); delay(70);
+      M5.Speaker.setVolume(255);
     }
+
+    // ===== Listen =====
+    if (!M5.Mic.begin() ||
+        !M5.Mic.record(audio_buffer, AUDIO_BUFFER_SAMPLES, AUDIO_SAMPLE_RATE)) {
+      set_audio_diag("mic failed", 3000);
+      M5.Mic.end();
+      break;
+    }
+    delay(400);  // warmup
+
+    face_override_active = true;
+    face_override_eye    = EyeState::WIDE;
+    face_override_mouth  = MouthShape::OPEN;
+    face_override_until  = millis() + AUDIO_RECORD_SECONDS * 1000 + 200;
+    set_led_override(0, 255, 0, AUDIO_RECORD_SECONDS * 1000, false);
+    current_idle_label   = (turn == 0) ? "talk to BMO" : "your turn";
+    idle_label_until     = millis() + AUDIO_RECORD_SECONDS * 1000;
+    draw_face(false);
+
+    unsigned long t0 = millis();
+    while (M5.Mic.isRecording() && (millis() - t0) < (AUDIO_RECORD_SECONDS * 1000 + 1000)) {
+      delay(50);
+    }
+    M5.Mic.end();
+
+    // ===== Silence detection: did user actually speak this turn? =====
+    int peak = 0;
+    for (size_t i = 0; i < AUDIO_BUFFER_SAMPLES; i++) {
+      int v = audio_buffer[i] < 0 ? -audio_buffer[i] : audio_buffer[i];
+      if (v > peak) peak = v;
+    }
+    if (peak < SILENCE_PEAK_THRESHOLD) {
+      if (turn == 0) {
+        snprintf(response_text, RESPONSE_TEXT_MAX,
+                 "BMO didn't hear anything. Try again whenever you're ready!");
+      } else {
+        snprintf(response_text, RESPONSE_TEXT_MAX,
+                 "(BMO is here whenever you want to talk more.)");
+      }
+      break;
+    }
+
+    // ===== Switch back to speaker =====
+    delay(300);
+    M5.Speaker.end(); delay(200);
+    M5.Speaker.begin(); M5.Speaker.setVolume(255);
+
+    // ===== Thinking / "Tilt" =====
+    M5StackChan.Motion.moveX(-100, 400);
+    M5StackChan.Motion.moveY(450, 400);
+    face_override_active = true;
+    face_override_eye    = EyeState::FLAT;
+    face_override_mouth  = MouthShape::NEUTRAL;
+    face_override_until  = millis() + 60000;
+    set_led_override(255, 180, 0, 60000, false);
+    current_idle_label   = "thinking...";
+    idle_label_until     = millis() + 60000;
+    draw_face(false);
+
+    // ===== Call Gemini =====
+    bool gemini_ok = call_gemini_with_audio();
+    if (!gemini_ok) {
+      // call_gemini already wrote an error into response_text -- show and bail
+      break;
+    }
+
+    // Append BMO's response to session history for context on next turn
+    session_history += " [BMO: ";
+    size_t n = strlen(response_text);
+    if (n > 140) n = 140;  // keep history bounded
+    for (size_t i = 0; i < n; i++) {
+      char c = response_text[i];
+      if (c == '"' || c == '[' || c == ']' || c == '\\') c = ' ';
+      session_history += c;
+    }
+    session_history += "]";
+
+    // ===== Speak with mouth sync + nod =====
+    M5StackChan.Motion.moveX(0, 500);
+    size_t tts_samples = synthesize_speech(response_text);
+    if (tts_samples > 0) play_with_mouth_sync(tts_samples);
+
+    // Brief pause before opening mic for the next turn
+    delay(600);
+    last_interaction_ms = millis();
   }
 
-  // Step 7: show text response on screen (in case audio missed or as record)
+  // ===== End-of-conversation screen =====
   led_override_active = false;
   face_override_active = false;
   showing_response = true;
@@ -1571,7 +1763,8 @@ void run_conversation() {
   last_interaction_ms = millis();
   current_idle_label = nullptr;
   draw_response_screen();
-  // Drain any stale tap that might have queued during run_conversation.
+
+  // Drain any stale tap that may have queued during the conversation
   M5StackChan.update();
   M5StackChan.TouchSensor.wasClicked();
   M5StackChan.TouchSensor.wasSwipedForward();
