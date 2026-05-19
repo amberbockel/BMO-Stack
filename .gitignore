@@ -1,0 +1,54 @@
+# --- macOS junk ---
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.AppleDouble
+.LSOverride
+
+# --- Arduino IDE 2.x build artifacts ---
+# Arduino compiles into a temp build/ folder next to the sketch.
+build/
+*.tmp
+
+# Compiled firmware binaries from a build (we DON'T want these in git)...
+*.hex
+*.elf
+*.map
+*.bin
+# ...EXCEPT the factory firmware backup. The backup/ folder is sacred (Phase 3).
+!backup/*.bin
+
+# Arduino library properties cache
+.arduino-ide/
+
+# --- ESP-IDF / PlatformIO (in case we use them later) ---
+.pio/
+.pioenvs/
+.piolibdeps/
+sdkconfig.old
+
+# --- Editors ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Secrets ---
+# Anything matching these patterns will be ignored. When we get to Phase 9 and
+# add the Anthropic API key, we'll put it in one of these files, NOT in code.
+.env
+.env.*
+secrets.h
+secrets.hpp
+credentials.h
+*.key
+*.pem
+
+# --- Python virtual environments (we'll likely use esptool in one) ---
+.venv/
+venv/
+__pycache__/
+*.pyc
