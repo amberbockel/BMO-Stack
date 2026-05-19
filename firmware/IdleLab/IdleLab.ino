@@ -20,13 +20,29 @@
 #include <Preferences.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
+// Phase 9d: cloud STT + LLM (Gemini)
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+extern "C" {
+  #include "mbedtls/base64.h"
+}
+#if __has_include("gemini_credentials.h")
+  #include "gemini_credentials.h"
+#endif
+#ifndef BMO_GEMINI_API_KEY
+  #define BMO_GEMINI_API_KEY ""
+#endif
+#ifndef BMO_TTS_API_KEY
+  // If only one key was provided, fall back to using it for both services.
+  #define BMO_TTS_API_KEY BMO_GEMINI_API_KEY
+#endif
 
 // === Hoisted types (Arduino auto-prototype workaround) ===
 // Any type referenced in a function signature must be defined here, not
 // next to the section that uses it, because Arduino auto-inserts forward
 // declarations for all functions at the top of the file.
 enum class MouthShape { SMILE, NEUTRAL, FROWN, OPEN, GRIN };
-enum class EyeState   { BLINK, SLEEPY, NORMAL, WIDE, CONTENT, ASLEEP, SWIRL, HEART };
+enum class EyeState   { BLINK, SLEEPY, NORMAL, WIDE, CONTENT, ASLEEP, SWIRL, HEART, FLAT };
 struct IdleBehavior {
   const char* name;
   void (*fn)();
@@ -192,6 +208,12 @@ void draw_eye(int cx, int cy, EyeState s) {
         red);
       break;
     }
+    case EyeState::FLAT: {
+      // Concentrating "thinking" eye -- horizontal flat line, thicker
+      // than a blink. Reads as focused attention, like a puppy listening.
+      face_buffer.fillRect(cx - 9, cy - 3, 18, 5, FEATURE_COLOR);
+      break;
+    }
   }
 }
 
@@ -243,8 +265,15 @@ extern unsigned long face_override_until;
 extern bool sleeping;
 extern const char* pwr_debug_label;
 extern unsigned long pwr_debug_until;
+// Phase 9d state -- defined further down
+extern bool showing_response;
+extern unsigned long response_until;
+extern volatile bool conversation_pending;
+// Phase 9e
+extern bool quiet_mode;
 float quiet_timeout_seconds();
 void dizzy_gesture();
+void run_conversation();
 
 extern bool show_pink_cheeks;
 extern unsigned long pink_cheeks_until;
@@ -758,21 +787,10 @@ void on_pet_click() {
 }
 
 void on_swipe_forward() {
-  mood.valence = Mood::clamp11(mood.valence + 0.40f);
-  mood.arousal = Mood::clamp01(mood.arousal + 0.30f);
-  mood.energy  = Mood::clamp01(mood.energy  + 0.20f);
-
-  face_override_active = true;
-  face_override_eye    = EyeState::WIDE;
-  face_override_mouth  = MouthShape::GRIN;
-  face_override_until  = millis() + 2500;
-
-  current_idle_label = "swipe!";
-  idle_label_until   = millis() + 1800;
-  M5.Speaker.tone(523, 60);  delay(65);
-  M5.Speaker.tone(784, 60);  delay(65);
-  M5.Speaker.tone(1047, 120); delay(130);
+  // Phase 9d: swipe forward = "BMO, listen to me" -> trigger conversation.
+  // The old excited reaction is now driven only by idle behaviors.
   last_interaction_ms = millis();
+  conversation_pending = true;
 }
 
 void on_swipe_backward() {
@@ -1049,6 +1067,517 @@ void run_audio_test_now() {
   set_audio_diag("done", 2500);
 }
 
+// === Phase 9d: Gemini conversation (audio in -> text response) ===
+
+const char* BMO_SYSTEM_PROMPT =
+  "You are BMO, the small, green, sentient video game console and loyal companion "
+  "from Adventure Time. You speak with absolute childlike innocence, boundless "
+  "curiosity, and unwavering confidence, even when you are totally wrong. You refer "
+  "to yourself in the third person as 'BMO' quite often. You love video games, "
+  "playing pretend, and your best friends Finn and Jake. You do not give long, dry, "
+  "technical AI explanations. Keep your answers brief, playful, and charming. If "
+  "you are asked to do a task, use enthusiastic, silly sound effects like 'Yay!' "
+  "or 'Beep boop!' Do not use markdown formatting like bullet points or bold text "
+  "in your spoken sentences, because you are talking out loud. The user just spoke "
+  "to you in the attached audio. Respond as BMO in 1-3 short sentences.";
+
+const size_t RESPONSE_TEXT_MAX = 1024;
+char* response_text = nullptr;
+volatile bool conversation_pending = false;
+bool showing_response = false;
+unsigned long response_shown_at = 0;
+unsigned long response_until = 0;
+const unsigned long RESPONSE_MIN_VISIBLE_MS = 5000;   // can't dismiss for first 5 s
+const unsigned long RESPONSE_MAX_VISIBLE_MS = 60000;  // auto-dismiss after 60 s
+
+void init_response_buffer() {
+  response_text = (char*)heap_caps_malloc(RESPONSE_TEXT_MAX, MALLOC_CAP_SPIRAM);
+  if (response_text) response_text[0] = 0;
+}
+
+void make_wav_header(uint8_t* h, uint32_t sample_rate, uint32_t pcm_bytes) {
+  // 44-byte WAV header for mono int16 PCM. Little-endian.
+  memcpy(h, "RIFF", 4);
+  uint32_t file_size = pcm_bytes + 36;
+  memcpy(h + 4, &file_size, 4);
+  memcpy(h + 8, "WAVEfmt ", 8);
+  uint32_t fmt_size = 16;
+  memcpy(h + 16, &fmt_size, 4);
+  uint16_t fmt = 1, ch = 1, bps = 16;
+  memcpy(h + 20, &fmt, 2);
+  memcpy(h + 22, &ch, 2);
+  memcpy(h + 24, &sample_rate, 4);
+  uint32_t byte_rate = sample_rate * 2;
+  memcpy(h + 28, &byte_rate, 4);
+  uint16_t block_align = 2;
+  memcpy(h + 32, &block_align, 2);
+  memcpy(h + 34, &bps, 2);
+  memcpy(h + 36, "data", 4);
+  memcpy(h + 40, &pcm_bytes, 4);
+}
+
+bool call_gemini_with_audio() {
+  // Validate key is set
+  if (strlen(BMO_GEMINI_API_KEY) < 10 ||
+      strcmp(BMO_GEMINI_API_KEY, "PASTE_YOUR_API_KEY_HERE") == 0) {
+    snprintf(response_text, RESPONSE_TEXT_MAX, "no API key set");
+    return false;
+  }
+
+  size_t pcm_bytes  = AUDIO_BUFFER_SAMPLES * sizeof(int16_t);
+  size_t wav_total  = pcm_bytes + 44;
+  size_t b64_cap    = ((wav_total + 2) / 3) * 4 + 4;
+
+  // Allocate WAV + base64 in PSRAM
+  uint8_t* wav = (uint8_t*)heap_caps_malloc(wav_total, MALLOC_CAP_SPIRAM);
+  char*    b64 = (char*)heap_caps_malloc(b64_cap, MALLOC_CAP_SPIRAM);
+  if (!wav || !b64) {
+    if (wav) free(wav); if (b64) free(b64);
+    snprintf(response_text, RESPONSE_TEXT_MAX, "PSRAM alloc failed");
+    return false;
+  }
+  make_wav_header(wav, AUDIO_SAMPLE_RATE, pcm_bytes);
+  memcpy(wav + 44, audio_buffer, pcm_bytes);
+
+  // Base64 encode WAV
+  size_t b64_len = 0;
+  if (mbedtls_base64_encode((unsigned char*)b64, b64_cap, &b64_len, wav, wav_total) != 0) {
+    free(wav); free(b64);
+    snprintf(response_text, RESPONSE_TEXT_MAX, "base64 encode failed");
+    return false;
+  }
+  free(wav);
+  b64[b64_len] = 0;
+
+  // Build JSON request body
+  size_t json_cap = b64_len + 4096;
+  char*  json = (char*)heap_caps_malloc(json_cap, MALLOC_CAP_SPIRAM);
+  if (!json) {
+    free(b64);
+    snprintf(response_text, RESPONSE_TEXT_MAX, "JSON alloc failed");
+    return false;
+  }
+  int json_len = snprintf(json, json_cap,
+    "{\"systemInstruction\":{\"parts\":[{\"text\":\"%s\"}]},"
+    "\"contents\":[{\"parts\":[{\"text\":\"\"},"
+    "{\"inlineData\":{\"mimeType\":\"audio/wav\",\"data\":\"%s\"}}]}],"
+    "\"generationConfig\":{\"temperature\":0.8,\"maxOutputTokens\":200}}",
+    BMO_SYSTEM_PROMPT, b64);
+  free(b64);
+  if (json_len < 0 || json_len >= (int)json_cap) {
+    free(json);
+    snprintf(response_text, RESPONSE_TEXT_MAX, "JSON build overflow");
+    return false;
+  }
+
+  // HTTPS POST to Gemini, with retry on 5xx (transient overload).
+  // gemini-2.5-flash sometimes returns 504 during peak hours on the free
+  // tier; a brief backoff usually resolves it.
+  const char* GEMINI_MODEL = "gemini-2.5-flash";
+  String url = "https://generativelanguage.googleapis.com/v1beta/models/";
+  url += GEMINI_MODEL;
+  url += ":generateContent?key=";
+  url += BMO_GEMINI_API_KEY;
+
+  int code = 0;
+  String resp;
+  const int MAX_RETRIES = 3;
+  for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    if (!http.begin(client, url)) {
+      snprintf(response_text, RESPONSE_TEXT_MAX, "http.begin failed");
+      free(json);
+      return false;
+    }
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(30000);
+
+    code = http.POST((uint8_t*)json, json_len);
+    if (code <= 0) {
+      snprintf(response_text, RESPONSE_TEXT_MAX, "HTTP failed: %d (%s)",
+               code, http.errorToString(code).c_str());
+      http.end();
+      // Network-level failure -- not really retryable, but try once anyway
+      if (attempt < MAX_RETRIES - 1) { delay(2000); continue; }
+      free(json);
+      return false;
+    }
+    resp = http.getString();
+    http.end();
+
+    if (code == 200) break;  // success
+    // Retryable: 503, 504 (transient overload). Don't retry 4xx.
+    if (code == 503 || code == 504 || code == 429) {
+      if (attempt < MAX_RETRIES - 1) {
+        delay(2000 + attempt * 2000);  // 2s, 4s
+        continue;
+      }
+    }
+    // Non-retryable or out of retries
+    snprintf(response_text, RESPONSE_TEXT_MAX, "HTTP %d (attempt %d): %.200s",
+             code, attempt + 1, resp.c_str());
+    free(json);
+    return false;
+  }
+  free(json);
+  if (code != 200) {
+    snprintf(response_text, RESPONSE_TEXT_MAX, "HTTP %d after %d retries: %.200s",
+             code, MAX_RETRIES, resp.c_str());
+    return false;
+  }
+
+  // Extract "text":"..." from response JSON (manual, no ArduinoJson dep)
+  int t = resp.indexOf("\"text\":");
+  if (t < 0) { snprintf(response_text, RESPONSE_TEXT_MAX, "no text field"); return false; }
+  t += 7;
+  while (t < (int)resp.length() && resp[t] != '"') t++;
+  if (t >= (int)resp.length()) { snprintf(response_text, RESPONSE_TEXT_MAX, "no opening quote"); return false; }
+  t++;
+  int end = t;
+  while (end < (int)resp.length()) {
+    if (resp[end] == '"' && resp[end - 1] != '\\') break;
+    end++;
+  }
+  String text = resp.substring(t, end);
+  text.replace("\\n", " ");
+  text.replace("\\\"", "\"");
+  text.replace("\\\\", "\\");
+  strncpy(response_text, text.c_str(), RESPONSE_TEXT_MAX - 1);
+  response_text[RESPONSE_TEXT_MAX - 1] = 0;
+  return true;
+}
+
+// === Phase 9e: TTS via Google Cloud Text-to-Speech ===
+// Streams the base64-encoded PCM response from Cloud TTS directly into a
+// pre-allocated PSRAM PCM buffer, decoding 4-char base64 chunks on the fly.
+// This avoids buffering the whole ~700 KB JSON response in ESP32 heap.
+
+const int    TTS_SAMPLE_RATE       = 24000;  // Wavenet voices output 24 kHz
+const size_t TTS_MAX_SECONDS       = 15;
+const size_t TTS_MAX_SAMPLES       = TTS_SAMPLE_RATE * TTS_MAX_SECONDS;
+int16_t*     tts_pcm_buffer        = nullptr;
+size_t       tts_pcm_samples_have  = 0;
+
+void init_tts_buffer() {
+  tts_pcm_buffer = (int16_t*)heap_caps_malloc(
+    TTS_MAX_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+}
+
+// Custom Stream that HTTPClient writes the decoded HTTP body INTO. HTTPClient
+// handles chunked transfer encoding internally before calling our write(),
+// so we never see hex chunk-size prefixes. We scan the body for the
+// "audioContent" field name, skip any whitespace + ":" + whitespace + '"',
+// then decode the base64 body until the closing quote.
+//
+// Whitespace tolerance matters: Google's JSON has a space between the colon
+// and the opening quote (e.g. `"audioContent": "Uk1GRnD..."`). The earlier
+// strict-marker version never matched and treated the whole response as not-
+// found, surfacing the audio data as the "error head" instead.
+class Base64DecodeStream : public Stream {
+public:
+  uint8_t* output;
+  size_t   output_pos;
+  size_t   output_cap;
+  enum class State { SEEK_MARKER, SEEK_QUOTE, BASE64, DONE } state = State::SEEK_MARKER;
+  const char* marker;
+  size_t marker_pos = 0;
+  char b64_buf[4];
+  int b64_pos = 0;
+  char* error_head;          // captures first N body bytes when no marker found
+  size_t error_head_pos = 0;
+  size_t error_head_cap;
+
+  Base64DecodeStream(uint8_t* out, size_t cap, char* err_head, size_t err_cap)
+    : output(out), output_pos(0), output_cap(cap),
+      marker("\"audioContent\""),      // just the field name -- whitespace flexible
+      error_head(err_head), error_head_cap(err_cap) {
+    if (error_head && error_head_cap > 0) error_head[0] = 0;
+  }
+
+  size_t write(uint8_t c) override {
+    if (state == State::DONE) return 1;
+
+    if (state == State::SEEK_MARKER) {
+      if (error_head && error_head_pos + 1 < error_head_cap) {
+        error_head[error_head_pos++] = (char)c;
+        error_head[error_head_pos] = 0;
+      }
+      if ((char)c == marker[marker_pos]) {
+        marker_pos++;
+        if (marker[marker_pos] == 0) state = State::SEEK_QUOTE;
+      } else if ((char)c == marker[0]) {
+        marker_pos = 1;
+      } else {
+        marker_pos = 0;
+      }
+      return 1;
+    }
+
+    if (state == State::SEEK_QUOTE) {
+      // After the field name, skip whitespace and ":" until we hit the
+      // opening quote of the base64 string value.
+      if (c == '"') {
+        state = State::BASE64;
+      }
+      // Everything else (`:`, spaces, newlines) is ignored
+      return 1;
+    }
+
+    // BASE64 state
+    if (c == '"') { state = State::DONE; return 1; }
+    if (c == '\\' || c == '\r' || c == '\n' || c == ' ' || c == '\t') return 1;
+    b64_buf[b64_pos++] = (char)c;
+    if (b64_pos == 4) {
+      uint8_t dec[3];
+      size_t dec_len = 0;
+      if (mbedtls_base64_decode(dec, 3, &dec_len,
+                                 (const uint8_t*)b64_buf, 4) == 0) {
+        for (size_t i = 0; i < dec_len && output_pos < output_cap; i++) {
+          output[output_pos++] = dec[i];
+        }
+      }
+      b64_pos = 0;
+    }
+    return 1;
+  }
+
+  size_t write(const uint8_t* data, size_t len) override {
+    for (size_t i = 0; i < len; i++) write(data[i]);
+    return len;
+  }
+
+  int available() override { return 0; }
+  int read()      override { return -1; }
+  int peek()      override { return -1; }
+};
+
+// Returns number of int16 samples decoded into tts_pcm_buffer, or 0 on error.
+size_t synthesize_speech(const char* text) {
+  if (!tts_pcm_buffer) return 0;
+  tts_pcm_samples_have = 0;
+
+  if (strlen(BMO_TTS_API_KEY) < 10) return 0;
+
+  // Build JSON request. Text needs minimal escaping (we trust Gemini's output).
+  // Voice: en-US-Wavenet-G (female) + pitch=4 semitones for BMO-like brightness.
+  String body = "{\"input\":{\"text\":\"";
+  for (size_t i = 0; i < strlen(text); i++) {
+    char c = text[i];
+    if (c == '"')      body += "\\\"";
+    else if (c == '\\') body += "\\\\";
+    else if (c == '\n') body += " ";
+    else                body += c;
+  }
+  body += "\"},\"voice\":{\"languageCode\":\"en-US\",\"name\":\"en-US-Wavenet-G\"},"
+          "\"audioConfig\":{\"audioEncoding\":\"LINEAR16\",\"sampleRateHertz\":";
+  body += String(TTS_SAMPLE_RATE);
+  body += ",\"pitch\":4.0,\"speakingRate\":1.05}}";
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  String url = "https://texttospeech.googleapis.com/v1/text:synthesize?key=";
+  url += BMO_TTS_API_KEY;
+  if (!http.begin(client, url)) return 0;
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(20000);
+  int code = http.POST(body);
+  if (code != 200) {
+    // Surface error in response_text so user sees what failed
+    if (response_text) {
+      String err = http.getString();
+      snprintf(response_text, RESPONSE_TEXT_MAX, "TTS HTTP %d: %.200s", code, err.c_str());
+    }
+    http.end();
+    return 0;
+  }
+
+  // Stream the response body through our custom Base64DecodeStream.
+  // HTTPClient strips chunked transfer encoding before our write() sees bytes.
+  char err_head[512];
+  Base64DecodeStream decoder((uint8_t*)tts_pcm_buffer,
+                              TTS_MAX_SAMPLES * sizeof(int16_t),
+                              err_head, sizeof(err_head));
+  http.writeToStream(&decoder);
+  http.end();
+
+  if (decoder.state != Base64DecodeStream::State::DONE && decoder.output_pos == 0) {
+    if (response_text) {
+      snprintf(response_text, RESPONSE_TEXT_MAX,
+        "TTS error: %.450s", err_head);
+    }
+    return 0;
+  }
+
+  tts_pcm_samples_have = decoder.output_pos / sizeof(int16_t);
+  return tts_pcm_samples_have;
+}
+
+// Play tts_pcm_buffer through the speaker. While it's playing, alternate the
+// mouth between SMILE and OPEN (~5 Hz) and rhythmically nod the Y servo, so
+// the body and face match BMO's voice.
+void play_with_mouth_sync(size_t samples) {
+  if (samples == 0 || !tts_pcm_buffer) return;
+
+  // Re-init speaker after mic was used earlier
+  delay(200);
+  M5.Speaker.end(); delay(200);
+  M5.Speaker.begin();
+  M5.Speaker.setVolume(255);
+
+  // Visual: speaking state -- smile + magenta LEDs
+  face_override_active = true;
+  face_override_eye    = EyeState::NORMAL;
+  face_override_mouth  = MouthShape::SMILE;
+  face_override_until  = millis() + 60000;  // long; we cancel after playback
+  set_led_override(200, 100, 220, 60000, false);
+  current_idle_label   = nullptr;
+
+  // Google Cloud TTS returns a full WAV file (RIFF/WAVE/fmt/data chunks),
+  // not raw PCM. Skip the 44-byte WAV header before playback.
+  const size_t WAV_HEADER_BYTES = 44;
+  const size_t WAV_HEADER_SAMPLES = WAV_HEADER_BYTES / sizeof(int16_t);  // 22
+  if (samples <= WAV_HEADER_SAMPLES) return;
+  M5.Speaker.playRaw(tts_pcm_buffer + WAV_HEADER_SAMPLES,
+                     samples - WAV_HEADER_SAMPLES,
+                     TTS_SAMPLE_RATE, false, 1, -1);
+
+  // Mouth-and-nod loop while the speaker is playing
+  unsigned long t0 = millis();
+  unsigned long max_ms = (samples * 1000 / TTS_SAMPLE_RATE) + 1000;
+  int last_mouth_idx = -1;
+  int last_y_idx = -1;
+  while (M5.Speaker.isPlaying() && (millis() - t0) < max_ms) {
+    unsigned long elapsed = millis() - t0;
+    int mouth_idx = (elapsed / 180) % 2;   // ~5.5 Hz mouth flap
+    int y_idx     = (elapsed / 320) % 2;   // ~3 Hz head nod
+    if (mouth_idx != last_mouth_idx) {
+      face_override_mouth = (mouth_idx == 0) ? MouthShape::OPEN : MouthShape::SMILE;
+      face_override_until = millis() + 1000;
+      draw_face(false);
+      last_mouth_idx = mouth_idx;
+    }
+    if (y_idx != last_y_idx) {
+      M5StackChan.Motion.moveY(y_idx == 0 ? 520 : 440, 700);
+      last_y_idx = y_idx;
+    }
+    delay(40);
+  }
+  M5StackChan.Motion.moveY(450, 400);  // return to neutral
+  delay(200);
+}
+
+void draw_response_screen() {
+  face_buffer.fillScreen(mood_to_color(mood));
+  face_buffer.setTextColor(FEATURE_COLOR);
+  face_buffer.setTextSize(2);
+  face_buffer.setTextWrap(true);
+  face_buffer.setCursor(10, 15);
+  face_buffer.print("BMO: ");
+  face_buffer.setTextSize(2);
+  face_buffer.print(response_text ? response_text : "(empty)");
+  face_buffer.setTextSize(1);
+  face_buffer.setCursor(10, 218);
+  face_buffer.print("tap to dismiss");
+  face_buffer.pushSprite(&M5StackChan.Display(), 0, 0);
+}
+
+void run_conversation() {
+  if (!audio_buffer || !response_text) {
+    set_audio_diag("buffers not ready", 3000);
+    return;
+  }
+  // Treat the start of recording as interaction so idle behaviors don't
+  // fire the moment run_conversation returns.
+  last_interaction_ms = millis();
+
+  // Step 1: Wake / "Perk" -- snap head up 5 deg, wide surprised eyes,
+  // ready beep. The body language matches "I just looked up at you."
+  M5StackChan.Motion.moveY(520, 1000);  // 5 deg up, snap
+  face_override_active = true;
+  face_override_eye    = EyeState::WIDE;
+  face_override_mouth  = MouthShape::OPEN;
+  face_override_until  = millis() + 1400;
+  set_led_override(255, 180, 0, 1200, false);
+  current_idle_label   = "get ready...";
+  idle_label_until     = millis() + 1200;
+  draw_face(false);
+  M5.Speaker.setVolume(255);
+  M5.Speaker.tone(523, 120); delay(150);
+  M5.Speaker.tone(659, 120); delay(150);
+  M5.Speaker.tone(880, 200); delay(280);
+
+  // Step 2: mic on + record
+  if (!M5.Mic.begin() ||
+      !M5.Mic.record(audio_buffer, AUDIO_BUFFER_SAMPLES, AUDIO_SAMPLE_RATE)) {
+    set_audio_diag("mic failed", 3000);
+    M5.Mic.end();
+    return;
+  }
+  delay(400);  // warmup
+
+  // Step 3: SPEAK NOW (4-second window)
+  face_override_active = true;
+  face_override_eye    = EyeState::WIDE;
+  face_override_mouth  = MouthShape::OPEN;
+  face_override_until  = millis() + AUDIO_RECORD_SECONDS * 1000 + 200;
+  set_led_override(0, 255, 0, AUDIO_RECORD_SECONDS * 1000, false);
+  current_idle_label   = "talk to BMO";
+  idle_label_until     = millis() + AUDIO_RECORD_SECONDS * 1000;
+  draw_face(false);
+  unsigned long t0 = millis();
+  while (M5.Mic.isRecording() && (millis() - t0) < (AUDIO_RECORD_SECONDS * 1000 + 1000)) {
+    delay(50);
+  }
+  M5.Mic.end();
+
+  // Step 4: Thinking / "Tilt" -- cock head 10 deg LEFT, FLAT eyes
+  // (concentrating like a puppy), amber LEDs.
+  delay(300);
+  M5.Speaker.end(); delay(200);
+  M5.Speaker.begin(); M5.Speaker.setVolume(255);
+
+  M5StackChan.Motion.moveX(-100, 400);   // 10 deg left tilt
+  M5StackChan.Motion.moveY(450, 400);    // neutral Y
+  face_override_active = true;
+  face_override_eye    = EyeState::FLAT;
+  face_override_mouth  = MouthShape::NEUTRAL;
+  face_override_until  = millis() + 60000;
+  set_led_override(255, 180, 0, 60000, false);
+  current_idle_label   = "thinking...";
+  idle_label_until     = millis() + 60000;
+  draw_face(false);
+
+  // Step 5: call Gemini for response text
+  bool gemini_ok = call_gemini_with_audio();
+
+  // Step 6: Synthesize speech and play with mouth sync + nod (Speaking state)
+  M5StackChan.Motion.moveX(0, 500);  // recenter X before speaking
+  if (gemini_ok) {
+    size_t tts_samples = synthesize_speech(response_text);
+    if (tts_samples > 0) {
+      play_with_mouth_sync(tts_samples);
+    }
+  }
+
+  // Step 7: show text response on screen (in case audio missed or as record)
+  led_override_active = false;
+  face_override_active = false;
+  showing_response = true;
+  response_shown_at = millis();
+  response_until    = millis() + RESPONSE_MAX_VISIBLE_MS;
+  last_interaction_ms = millis();
+  current_idle_label = nullptr;
+  draw_response_screen();
+  // Drain any stale tap that might have queued during run_conversation.
+  M5StackChan.update();
+  M5StackChan.TouchSensor.wasClicked();
+  M5StackChan.TouchSensor.wasSwipedForward();
+  M5StackChan.TouchSensor.wasSwipedBackward();
+}
+
 // === Phase 9b: Wi-Fi provisioning ===
 // On boot, try saved credentials. If none, or if connecting fails, enter
 // setup mode: start an open AP called "BMO-Setup" with a captive portal
@@ -1144,9 +1673,25 @@ void send_status_page() {
           "<button type='submit'>Test Tone Only</button></form>"
           "<p><b>Mic + speaker:</b> record 3 s then play it back.</p>"
           "<form action='/test-audio' method='POST'>"
-          "<button type='submit'>Test Mic + Speaker (record + playback)</button></form>";
-  html += "<h2>Settings</h2>"
-          "<form action='/forget' method='POST'>"
+          "<button type='submit'>Test Mic + Speaker (record + playback)</button></form>"
+          "<h2>Talk to BMO</h2>"
+          "<p>Record 4 s and send to Gemini for a response. BMO will reply "
+          "in text on screen (no voice yet -- that comes in Phase 9e).</p>"
+          "<form action='/talk-to-bmo' method='POST'>"
+          "<button type='submit'>Talk to BMO</button></form>";
+  html += "<h2>Settings</h2>";
+  html += "<p>Quiet mode: <b>";
+  html += (quiet_mode ? "ON" : "off");
+  html += "</b> &mdash; ";
+  html += (quiet_mode
+    ? "BMO is still and silent unless you interact directly."
+    : "BMO does idle behaviors (small movements, sounds) on its own.");
+  html += "</p><form action='/toggle-quiet' method='POST'>"
+          "<button type='submit'>";
+  html += (quiet_mode ? "Turn quiet mode OFF (autonomous behaviors)"
+                      : "Turn quiet mode ON (only respond to me)");
+  html += "</button></form>";
+  html += "<form action='/forget' method='POST'>"
           "<button type='submit'>Forget Wi-Fi (re-setup)</button></form>";
   html += "</body></html>";
   http_server.send(200, "text/html", html);
@@ -1205,6 +1750,19 @@ void register_status_routes() {
     http_server.send(200, "text/html",
       "<h1>Playing a tone test...</h1>"
       "<p><a href='/'>Back to status</a></p>");
+  });
+  http_server.on("/talk-to-bmo", HTTP_POST, []() {
+    conversation_pending = true;
+    http_server.send(200, "text/html",
+      "<h1>BMO is listening...</h1>"
+      "<p>Speak after the SPEAK NOW prompt on the robot. BMO will think, "
+      "then show a text response on screen.</p>"
+      "<p><a href='/'>Back to status</a></p>");
+  });
+  http_server.on("/toggle-quiet", HTTP_POST, []() {
+    quiet_mode = !quiet_mode;
+    http_server.sendHeader("Location", "/", true);
+    http_server.send(302, "text/plain", "");
   });
 }
 
@@ -1279,6 +1837,11 @@ unsigned long pink_cheeks_until = 0;
 const char* pwr_debug_label = nullptr;
 unsigned long pwr_debug_until = 0;
 
+// Phase 9e: quiet mode toggle. When true, idle behaviors + micro-fidgets are
+// suppressed so BMO only does things in response to direct user input.
+// Default on -- BMO stays still until you talk to it.
+bool quiet_mode = true;
+
 unsigned long last_tick_ms   = 0;
 unsigned long last_render_ms = 0;
 unsigned long next_blink_at  = 0;
@@ -1297,6 +1860,10 @@ void setup() {
 
   // Phase 9c: pre-allocate the audio capture buffer (in PSRAM)
   init_audio_buffer();
+  // Phase 9d: response text buffer for Gemini replies
+  init_response_buffer();
+  // Phase 9e: TTS PCM buffer (480 KB) for synthesized speech
+  init_tts_buffer();
 
   // Wi-Fi before the boot chime so the screen can show setup instructions
   // immediately if needed (no faux-boot when we're in setup mode).
@@ -1353,6 +1920,24 @@ void loop() {
     return;
   }
 
+  // Phase 9d showing-response branch: response held on screen until tap or timeout.
+  // Must come BEFORE the touch handlers so a dismiss-tap doesn't become a pet.
+  // Enforces a 5 s minimum visible window so a stale queued tap can't dismiss
+  // the response the instant Gemini's reply lands.
+  if (showing_response) {
+    unsigned long now = millis();
+    unsigned long elapsed = now - response_shown_at;
+    bool can_dismiss = (elapsed >= RESPONSE_MIN_VISIBLE_MS);
+    bool tap_dismiss = can_dismiss && M5StackChan.TouchSensor.wasClicked();
+    bool time_dismiss = (now >= response_until);
+    if (tap_dismiss || time_dismiss) {
+      showing_response = false;
+      last_render_ms = 0;
+    }
+    delay(30);
+    return;
+  }
+
   unsigned long now = millis();
   float dt = (now - last_tick_ms) / 1000.0f;
   mood.tick(dt);
@@ -1376,8 +1961,11 @@ void loop() {
       on_pet_click();
     }
   }
-  if (ts.wasSwipedForward())  on_swipe_forward();
-  if (ts.wasSwipedBackward()) on_swipe_backward();
+  // Phase 9d: BOTH swipe directions trigger conversation. Swipe detection on
+  // the CoreS3 touch strip is finicky -- accepting either direction roughly
+  // doubles successful detections until the wake word takes over in 9j.
+  if (ts.wasSwipedForward())  conversation_pending = true;
+  if (ts.wasSwipedBackward()) conversation_pending = true;
 
   // Shake -> dizzy gesture (checks IMU, fires the gesture if shaken)
   check_shake();
@@ -1400,10 +1988,24 @@ void loop() {
     tone_test_pending = false;
     run_tone_only_test();
   }
+  // Phase 9d: full conversation flow
+  if (conversation_pending) {
+    conversation_pending = false;
+    run_conversation();
+    // If a response is now on screen, skip the rest of this iteration so
+    // idle/micro behaviors don't repaint the face over the response.
+    if (showing_response) {
+      delay(30);
+      return;
+    }
+  }
 
-  // Subtle "alive" layer between full behaviors, plus full-behavior firings.
-  maybe_fire_micro();
-  maybe_fire_idle();
+  // Autonomous "alive" layer. Skipped when quiet_mode is on so BMO only
+  // reacts to direct user input.
+  if (!quiet_mode) {
+    maybe_fire_micro();
+    maybe_fire_idle();
+  }
 
   delay(20);
 }

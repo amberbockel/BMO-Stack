@@ -15,10 +15,14 @@ Project is well past the original brief's Phase 8. The robot now has: factory fi
 ### First three things to do when resuming
 
 1. **Re-orient.** Read `notes/project-brief.md` + this section + most recent chronological log entry. ~5 min.
-2. **Verify connectivity.** Plug robot in, watch it boot. Should connect to home Wi-Fi automatically, show "wifi" indicator top-left. Run `arp -a | grep bmo` or open `http://bmo.local/` to confirm reachable.
-3. **Begin Phase 9c — Host machine setup.** This is the architecture-decision phase: pick a host (Pi 5, Mac mini, spare laptop), install Whisper.cpp + Piper + Python + a small HTTP service, get an Anthropic API key. After 9c, the robot has a brain it can talk to.
+2. **Verify the conversation flow still works.** Plug robot in, wait for Wi-Fi connect (see "wifi" indicator top-left). Open `http://bmo.local/` -> "Talk to BMO" -> say something. Robot should: Perk + ready beep -> SPEAK NOW (4s) -> Tilt + thinking -> Nod + speak the response. If that works end-to-end, system is healthy.
+3. **Begin Phase 9j -- wake word "Hey BMO"** (or built-in wake word like "Hi ESP" to start). Use Espressif's ESP-SR library which is already bundled in the m5stack ESP32 platform package. Continuous wake-word listening on the chip itself, no cloud round-trip for activation. ~2 sessions of work.
 
-### Phase 9 — Claude API path locked. Remaining phases:
+### Phase 9 architecture (final, after the local-host detour)
+
+**No local host needed.** Robot connects directly to Google APIs over Wi-Fi (Gemini for STT+LLM, Cloud TTS for voice output). Same architecture pattern the StackChan factory firmware uses, just pointed at our API keys instead of M5Stack's.
+
+### Remaining phases:
 
 These are flagged from earlier in the project but not resolved. Decide before Phase 9 begins.
 
@@ -286,6 +290,49 @@ The original brief is preserved verbatim in `project-brief.md`. README now refle
   - Low energy → more sleepy / slow gestures.
   - High valence → more bouncy / happy ones.
 - The brief explicitly says: **"Spend real time tuning weights and behaviors here."** This is where the tune-over-ship rule earns its keep.
+
+---
+
+## 2026-05-19 (Phase 9d + 9e) — Conversation with Gemini + TTS voice output
+
+**Architecture (final for this phase):** Robot connects directly to Google APIs over Wi-Fi -- no Pi or Mac host required. The original "out of the box" StackChan architecture pattern (cloud-direct), just pointed at Google's free-tier services instead of M5Stack's proprietary backend.
+
+- **STT + LLM:** Gemini 2.5 Flash (free tier 1500 req/day). Audio sent inline as base64 WAV.
+- **TTS:** Google Cloud Text-to-Speech `en-US-Wavenet-G` voice + pitch +4 semitones for BMO brightness.
+- **Two keys** (in `gemini_credentials.h`, gitignored): `BMO_GEMINI_API_KEY` from AI Studio for Generative Language API, `BMO_TTS_API_KEY` from GCP project for Cloud TTS. Two keys because the AI Studio key path didn't surface "Generative Language API" in the GCP API restrictions dropdown reliably. Two keys works.
+
+**BMO personality prompt** (from Amber's style guide, verbatim): "You are BMO, the small, green, sentient video game console and loyal companion from Adventure Time. You speak with absolute childlike innocence, boundless curiosity, and unwavering confidence, even when you are totally wrong. You refer to yourself in the third person as 'BMO' quite often..." plus instructions to avoid markdown and keep responses short.
+
+**State animations** (matching the user-provided style spec):
+- **Wake / "Perk"**: 5 deg tilt up + WIDE eyes + OPEN mouth + 3-note ascending ready beep
+- **Listening**: WIDE + OPEN + bright green LEDs + "SPEAK NOW!" prompt (4 second recording window)
+- **Thinking / "Tilt"**: 10 deg head left + new **EyeState::FLAT** (horizontal flat line eyes, concentrating-puppy) + NEUTRAL mouth + amber LEDs
+- **Speaking / "Nod"**: rhythmic Y servo bob (520<->440 every 320ms) + mouth alternates SMILE/OPEN at ~5.5 Hz + magenta LEDs, all running while TTS audio plays
+- After speech, response text shown on screen for 5-60 seconds, tap to dismiss
+
+**Trip wires hit and resolved (significant ones):**
+
+1. **HTTPS POST + long-blocking work in HTTP handler context made the second half never execute.** Refactored: HTTP handler just sets a `volatile bool conversation_pending = true`; the main loop drains the flag and runs `run_conversation()` outside HTTP context.
+
+2. **`M5.Speaker.begin()` after `M5.Mic.end()` returned true but speaker was effectively dead.** Resolved with aggressive `delay(200); M5.Speaker.end(); delay(200); M5.Speaker.begin(); M5.Speaker.setVolume(255)` reset between mic and speaker.
+
+3. **First ~300 ms of speech kept getting cut off** because mic has warmup latency. Added a 3-note ready beep + 400 ms warmup delay + bright "SPEAK NOW!" prompt so user starts speaking only after the prompt.
+
+4. **Showing-response screen got immediately dismissed** by a stale tap event queued during `run_conversation()`. Resolved with a 5 s minimum-visible window + explicit drain of `wasClicked()/wasSwipedForward()/wasSwipedBackward()` right after entering showing-response state.
+
+5. **Idle behaviors fired right over the response screen.** Resolved by checking `if (showing_response) return;` right after `run_conversation()` returns, and by setting `last_interaction_ms = millis()` at start AND end of run_conversation.
+
+6. **TTS parsing returned the literal string "4dd0"** from the response. Cause: I was using `WiFiClient::getStreamPtr()` which gives raw socket bytes including HTTP chunked-transfer-encoding chunk-size prefixes ("4dd0" = hex chunk size = 19920 bytes). Fix: replaced with a custom `Base64DecodeStream : public Stream` and used `HTTPClient::writeToStream(&decoder)`. HTTPClient handles chunked decoding internally before calling our `write()`.
+
+7. **Even after fixing chunked encoding, parser still failed** because my marker was `"audioContent":"` (no spaces) but Google's JSON returns `"audioContent": "..."` with a space between the colon and the opening quote. Made the marker `"audioContent"` only, then a SEEK_QUOTE state that skips whitespace + `:` until finding the opening `"`.
+
+8. **TTS audio is a WAV file, not raw PCM.** Google's API for LINEAR16 returns the audio with a RIFF/WAVE header. `M5.Speaker.playRaw` expects raw PCM. Skipped the 44-byte WAV header before playback. (Could be more robust by parsing the actual `data` chunk offset; for now the standard 44-byte assumption holds for Google's output.)
+
+9. **Gemini 504 transient overload on free tier.** Added retry logic: 3 attempts with 2 s / 4 s backoffs. Retries trigger on 503/504/429 only.
+
+**Quiet mode added**: idle behaviors and micro-fidgets are now suppressed by default. Amber wanted BMO still and silent unless responding to direct input. Toggle on the status page if she ever wants autonomous behaviors back.
+
+**Status at end of phase:** Amber: BMO actually spoke. Response quality needs tuning (next iteration); wake word "Hey BMO" is the next big feature (Phase 9j, ESP-SR-based, ~2 sessions). The full pipeline works end-to-end: robot mic -> Gemini -> Cloud TTS -> robot speaker.
 
 ---
 

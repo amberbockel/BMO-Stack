@@ -37,13 +37,16 @@ sdkconfig.old
 *~
 
 # --- Secrets ---
-# Anything matching these patterns will be ignored. When we get to Phase 9 and
-# add the Anthropic API key, we'll put it in one of these files, NOT in code.
+# Anything matching these patterns will be ignored. API keys, Wi-Fi creds,
+# anything user-specific lives in these files (never committed).
 .env
 .env.*
 secrets.h
 secrets.hpp
 credentials.h
+*_credentials.h
+gemini_credentials.h
+wifi_credentials.h
 *.key
 *.pem
 
