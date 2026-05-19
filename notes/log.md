@@ -4,6 +4,77 @@ Newest entries on top. After every working session, append a new block: what we 
 
 ---
 
+## NEXT SESSION — RESUME HERE
+
+> Pinned section. Read this first when you come back. Last updated 2026-05-19, end of session that built Phases 0–7 + drawn-face expressions.
+
+### Where we are (one paragraph)
+
+Eleven commits in git, latest is `5ec4a25`. The robot has: factory firmware safely backed up (`backup/factory-firmware-2026-05-18.bin` + RESTORE.md), a 10-gesture body language vocabulary (`firmware/GestureLab/`), a 9-sound procedural chiptune voice (also in GestureLab), a mood state machine with decay-toward-neutral over 30–120s (`firmware/MoodLab/`), and a drawn BMO face on the MoodLab screen with white teeth on smile, dark dot eyes, auto-blinks every 3–7s, and a color that shifts with valence and energy. MoodLab v6 is what's currently on the chip.
+
+### First three things to do when resuming
+
+1. **Re-orient.** Read `notes/project-brief.md` (the original goal), this resume section, and the most recent chronological log entry below. ~5 min.
+2. **Verify the toolchain still works.** Plug the robot in. Run `ls /dev/cu.*` — note the new port name (the trailing digits can change between sessions). Re-upload MoodLab to confirm flow:
+   ```
+   CLI="/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli"
+   cd ~/stackchan-bmo
+   "$CLI" compile --fqbn m5stack:esp32:m5stack_cores3 firmware/MoodLab
+   "$CLI" upload  --fqbn m5stack:esp32:m5stack_cores3 --port /dev/cu.usbmodemXXXX firmware/MoodLab
+   ```
+3. **Start Phase 8** (the BMO core — idle behavior loop). Design below.
+
+### Phase 8 starting plan (draft — expect tuning)
+
+- New sketch: `firmware/IdleLab/IdleLab.ino`. Copies Mood + face rendering from MoodLab, adds an idle behavior loop on top.
+- Quiet-detection: track `last_interaction_ms` on every touch; fire an idle behavior when `millis() - last_interaction_ms` exceeds a mood-modulated threshold (15–25 s when aroused, 40–60 s when low-energy, ~30 s baseline).
+- Idle behavior pool (new, to be designed):
+  - `hum_short` — 4-note chiptune phrase, composing from existing tones.
+  - `look_around` — pan L → pause → pan R → pause → recenter.
+  - `talk_to_corner` — turn head to a corner, play babbling phrase (multiple chiptune tones).
+  - `practice_speech` — small head movements + repeating phrases (rehearsing for a future conversation).
+  - `idle_blink` — single slow_blink, nothing else.
+  - Plus occasional weighted-random picks of the existing emotion gestures.
+- Weight table is mood-biased:
+  - High arousal → shorter quiet timeouts, more bouncy picks.
+  - Low energy → slow/sleepy picks (sigh, slow_blink), longer timeouts.
+  - High valence → happy picks (excited_wiggle, happy_bounce, hum_short).
+  - Low valence → quiet picks (sigh, sad_droop, freeze).
+- **The real work is tuning the weights and timings** so it feels alive without being annoying. The brief says: *"Spend real time tuning weights and behaviors here."* Expect 30+ minutes of watching the robot and adjusting numbers.
+
+### Phase 9 decisions to make before writing any networking code
+
+These are flagged from earlier in the project but not resolved. Decide before Phase 9 begins.
+
+- **Local LLM host:** MacBook (Ollama, free, requires laptop awake) / Raspberry Pi 5 (Ollama + whisper.cpp + piper, $80–$200 one-time, always-on) / hybrid (local primary + Anthropic API fallback).
+- **Memory format:** JSON file / SQLite / vector store. Depends on host choice.
+- **Speech I/O:** voice in/out from day one, or text-only first then layer in audio?
+- **Wi-Fi credentials:** hardcoded in flash, or provisioning UI on the robot?
+
+The `brenpoly/be-more-agent` GitHub repo (Pi 5 + Ollama + whisper.cpp + piper) is a working reference architecture for the local-LLM path.
+
+### Architecture notes — banked, don't re-derive
+
+- `arduino-cli` is bundled inside Arduino IDE 2.x at `/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli`. Use it for everything. Shares data dir with the GUI.
+- Installed: M5Stack package 3.3.7, M5StackChan 1.0.1, M5Unified 0.2.15, M5GFX 0.2.21.
+- CoreS3 uses ESP32-S3 **native USB**. No serial driver needed on macOS. Port: `/dev/cu.usbmodemXXXX`.
+- Rosetta 2 is installed (required for the bundled `ctags`).
+- esptool reads default to ~91 kbit/s. For full-flash reads pass `--baud 921600`. Writes already negotiate higher baud automatically.
+- Mood-color math (in MoodLab): BMO teal baseline (55, 200, 170). Valence shifts hue. Energy multiplies brightness 0.4–1.0×. Arousal does NOT map to color — it drives eye state (`NORMAL` → `WIDE`) and the open-mouth threshold.
+- Face rendering uses `LGFX_Sprite` in PSRAM to avoid flicker. Setup: `face_buffer.setPsram(true); face_buffer.setColorDepth(16); face_buffer.createSprite(320, 240);` Push to screen with `face_buffer.pushSprite(&M5StackChan.Display(), 0, 0);`.
+- Arduino auto-prototyping gotcha: `enum class` types referenced by functions must be defined BEFORE the auto-generated forward declarations get inserted (right below the `#include` block). MoodLab hoists `MouthShape` and `EyeState` for this reason.
+
+### Sanity-check commands
+
+```
+cd ~/stackchan-bmo
+git log --oneline | head             # should end with the eleven commits below
+ls backup/                            # factory-firmware-2026-05-18.bin + RESTORE.md
+ls /dev/cu.*                          # robot present if plugged in
+```
+
+---
+
 ## 2026-05-18 (continued) — Phase 1 in progress; phase order corrected
 
 **Did:**
