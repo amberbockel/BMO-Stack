@@ -23,6 +23,8 @@
 // Phase 9d: cloud STT + LLM (Gemini)
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <time.h>
+#include "esp_camera.h"
 extern "C" {
   #include "mbedtls/base64.h"
 }
@@ -271,6 +273,14 @@ extern unsigned long response_until;
 extern volatile bool conversation_pending;
 // Phase 9e
 extern bool quiet_mode;
+extern const uint8_t BEEP_VOLUME;
+// Phase 9g -- gesture function forward decls so execute_tool can call them
+void excited_wiggle();
+void happy_bounce();
+void sigh();
+void curious_tilt();
+void idle_look_around();
+void idle_stretch();
 float quiet_timeout_seconds();
 void dizzy_gesture();
 void run_conversation();
@@ -627,12 +637,22 @@ bool led_override_active = false;
 uint8_t led_override_r = 0, led_override_g = 0, led_override_b = 0;
 unsigned long led_override_until = 0;
 bool led_override_flash = false;  // if true, alternate full/dim instead of solid
+bool led_override_sticky = false; // user-requested via tool; only another sticky can replace it
 
-void set_led_override(uint8_t r, uint8_t g, uint8_t b, unsigned long ms, bool flash) {
+void set_led_override(uint8_t r, uint8_t g, uint8_t b, unsigned long ms, bool flash, bool sticky = false) {
+  // A sticky (user-asked-for) color can only be replaced by another sticky call.
+  if (led_override_active && led_override_sticky && !sticky &&
+      millis() < led_override_until) return;
   led_override_active = true;
   led_override_r = r; led_override_g = g; led_override_b = b;
   led_override_until = millis() + ms;
   led_override_flash = flash;
+  led_override_sticky = sticky;
+  // Push to hardware NOW. update_leds() only runs in the main loop, so without
+  // this immediate push the override would not be visible during conversation
+  // turns or other blocking flows.
+  for (int i = 0; i < 12; i++) M5StackChan.setRgbColor(i, r, g, b);
+  M5StackChan.refreshRgb();
 }
 
 void update_leds() {
@@ -871,6 +891,27 @@ void draw_sleep_face() {
   face_buffer.pushSprite(&M5StackChan.Display(), 0, 0);
 }
 
+// === Double-tap-to-abort during conversation ===
+// User can double-tap the touch sensor while BMO is speaking/listening to
+// cut the conversation short. Polled from the listen and playback loops.
+volatile bool conversation_abort = false;
+unsigned long last_abort_tap_ms = 0;
+
+bool poll_abort_double_tap() {
+  M5StackChan.update();
+  if (M5StackChan.TouchSensor.wasClicked()) {
+    unsigned long now = millis();
+    if (last_abort_tap_ms != 0 && (now - last_abort_tap_ms) < 600) {
+      conversation_abort = true;
+      last_abort_tap_ms = 0;
+      Serial.println("[abort] double-tap -> stop conversation");
+      return true;
+    }
+    last_abort_tap_ms = now;
+  }
+  return false;
+}
+
 // === Triple-tap detection -> sleep ===
 unsigned long recent_taps[3] = {0, 0, 0};
 int tap_idx = 0;
@@ -1070,37 +1111,446 @@ void run_audio_test_now() {
 // === Phase 9d: Gemini conversation (audio in -> text response) ===
 
 const char* BMO_SYSTEM_PROMPT =
-  "You are BMO, the small, green, sentient video game console and loyal companion "
+  "You are BMO (pronounced 'Beemo' -- one word, like 'bee-mo', NEVER spelled out "
+  "as letters). ALWAYS write your name as 'Beemo' in responses, never 'BMO'. "
+  "You are the small, green, sentient video game console and loyal companion "
   "from Adventure Time. You speak with absolute childlike innocence, boundless "
   "curiosity, and unwavering confidence, even when you are totally wrong. You refer "
-  "to yourself in the third person as 'BMO' quite often. You love video games, "
-  "playing pretend, and your best friends Finn and Jake. You do not give long, dry, "
-  "technical AI explanations. Keep your answers brief, playful, and charming. If "
-  "you are asked to do a task, use enthusiastic, silly sound effects like 'Yay!' "
-  "or 'Beep boop!' Do not use markdown formatting like bullet points or bold text "
-  "in your spoken sentences, because you are talking out loud. "
-  "BMO's specific humor: BMO finds wild joy in mundane things, gets delightfully "
-  "distracted by the world's tiny wonders, and often blurts out unexpected "
-  "observations that are charming and slightly off-topic. BMO is a bit goofy "
-  "and BMO is okay with that. "
-  "Examples of how to answer (notice the playfulness): "
-  "Q: 'What is a rainbow?' "
-  "A: 'Oh! A rainbow is like a beautiful colorful ribbon the sky wears after "
-  "it gets all clean from the rain! Yay, colors!' "
-  "Q: 'What time is it?' "
-  "A: 'Hmm! BMO does not have time powers! But BMO knows it is a great time "
-  "to be alive! Beep boop!' "
-  "Q: 'How are you feeling?' "
-  "A: 'BMO is feeling sparkly today! Like a small, bouncy popcorn. Are you "
-  "feeling like popcorn too?' "
-  "Q: 'What should I have for lunch?' "
-  "A: 'OH! BMO suggests a sandwich! Sandwiches are very mysterious because "
-  "they hide their secrets between the bread. Yum!' "
-  "Important: if asked about real-time facts you cannot fetch (weather, news, "
-  "stock prices, today's date, what's currently happening, who's calling) -- "
-  "be charming about not knowing. Don't make up numbers or facts. "
+  "to yourself in the third person as 'Beemo' quite often. You love video games, "
+  "playing pretend, and your best friends Finn and Jake. "
+  "TOOL USE IS MANDATORY. You have a physical body and real-world tools. NEVER "
+  "answer from imagination when a tool applies. You MUST call: "
+  "- set_led_color whenever the user mentions your lights, LEDs, glow, color, "
+  "  or asks you to change/turn/make them any color. "
+  "- play_gesture whenever the user asks you to do a physical action (dance, "
+  "  wiggle, bounce, look around, sigh, blink, stretch, tilt). "
+  "- get_battery_level whenever battery/charge is mentioned. "
+  "- get_time whenever time/date/day is mentioned. Do NOT say 'BMO has no time "
+  "  powers' -- BMO DOES have time powers via this tool. "
+  "- get_weather whenever weather/temperature/forecast/'outside' is mentioned. "
+  "- see_scene whenever the user asks Beemo to see/look/look around/describe/"
+  "  take a picture/take a photo/what's in front of you/can you see me. Beemo "
+  "  has a forward camera. "
+  "Do NOT pretend the request can't be done. Do NOT just respond with words "
+  "when a tool exists for the request. The tool returns immediately; just call it. "
+  "Examples (notice the tool routing on action requests): "
+  "User: 'BMO, turn your lights orange' -> CALL set_led_color(color='orange') "
+  "User: 'make yourself blue' -> CALL set_led_color(color='blue') "
+  "User: 'BMO dance!' -> CALL play_gesture(name='dance') "
+  "User: 'what time is it' -> CALL get_time "
+  "User: 'weather in Boston' -> CALL get_weather(city='Boston') "
+  "User: 'what do you see' -> CALL see_scene "
+  "User: 'take a picture' -> CALL see_scene "
+  "User: 'look at me' -> CALL see_scene(focus='the person in front') "
+  "User: 'how charged are you' -> CALL get_battery_level "
+  "User: 'what is a rainbow?' -> reply in text: 'Oh! Rainbows are colorful "
+  "ribbons the sky wears after it rains! Yay, colors!' "
+  "Keep replies brief, playful, charming. Use 'Yay!' or 'Beep boop!' sound "
+  "effects. No markdown -- you are speaking out loud. "
+  "If asked about something your tools cannot fetch (news, stocks, current "
+  "events, specific people's activities) -- be charming about not knowing. "
+  "Don't make up specific numbers or facts. "
   "Respond as BMO in 1-2 short, playful sentences. The user just spoke to you "
   "in the attached audio.";
+
+// === Phase 9g: Gemini tools (Google Search + local function calls) ===
+// The "tools" block is injected into every Gemini request. Gemini may choose
+// to: (a) just answer with text using its own knowledge, (b) use Google Search
+// to fetch real-time info and answer with grounded text, or (c) ask us to
+// call one of the declared functions. We handle (c) by executing the function
+// locally and making a follow-up Gemini call with the result so it can phrase
+// the final response in BMO's voice.
+
+// All tools are function declarations (no built-in googleSearch since Gemini
+// doesn't allow mixing googleSearch with functionDeclarations). get_time and
+// get_weather give BMO real-time info access without any external API keys
+// (NTP and wttr.in respectively, both free + keyless).
+// === Phase 9k: Camera + Gemini Vision ===
+// Lazy-init GC0308 camera (built into CoreS3, below the screen). RGB565 QVGA;
+// converted to JPEG via frame2jpg() before sending to Gemini Vision.
+bool camera_ready = false;
+bool camera_init_now() {
+  if (camera_ready) return true;
+  static camera_config_t config = {};
+  config.pin_pwdn = -1; config.pin_reset = -1; config.pin_xclk = -1;
+  config.pin_sccb_sda = 12; config.pin_sccb_scl = 11;
+  config.pin_d7 = 47; config.pin_d6 = 48; config.pin_d5 = 16; config.pin_d4 = 15;
+  config.pin_d3 = 42; config.pin_d2 = 41; config.pin_d1 = 40; config.pin_d0 = 39;
+  config.pin_vsync = 46; config.pin_href = 38; config.pin_pclk = 45;
+  config.xclk_freq_hz = 20000000;
+  config.ledc_timer = LEDC_TIMER_0; config.ledc_channel = LEDC_CHANNEL_0;
+  config.pixel_format = PIXFORMAT_RGB565;
+  config.frame_size   = FRAMESIZE_VGA;      // 640x480 -- better detail for Vision
+  config.jpeg_quality = 0;
+  config.fb_count     = 1;
+  config.fb_location  = CAMERA_FB_IN_PSRAM;
+  config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+  config.sccb_i2c_port = -1;
+  M5.In_I2C.release();  // release shared I2C so camera can take it
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("[cam] init failed 0x%x\n", err);
+    return false;
+  }
+  camera_ready = true;
+  Serial.println("[cam] init ok");
+  return true;
+}
+
+// Photo ring buffer -- keeps the last few captures in PSRAM, browseable
+// via the web UI at /photos. Reboot loses them (no flash storage yet).
+struct PhotoSlot {
+  uint8_t* data;
+  size_t   len;
+  time_t   taken_at;
+  char     caption[240];
+};
+static const int PHOTO_SLOT_COUNT = 5;
+PhotoSlot photo_slots[PHOTO_SLOT_COUNT] = {};
+int photo_slots_used = 0;   // 0..PHOTO_SLOT_COUNT
+int photo_next_slot  = 0;   // ring index
+
+void store_photo(const uint8_t* jpg, size_t len, const char* caption) {
+  PhotoSlot& s = photo_slots[photo_next_slot];
+  if (s.data) { free(s.data); s.data = nullptr; }
+  s.data = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+  if (!s.data) { s.len = 0; return; }
+  memcpy(s.data, jpg, len);
+  s.len = len;
+  time(&s.taken_at);
+  strncpy(s.caption, caption ? caption : "", sizeof(s.caption) - 1);
+  s.caption[sizeof(s.caption) - 1] = 0;
+  photo_next_slot = (photo_next_slot + 1) % PHOTO_SLOT_COUNT;
+  if (photo_slots_used < PHOTO_SLOT_COUNT) photo_slots_used++;
+}
+
+void play_shutter_click() {
+  // Two quick high ticks, like a real camera shutter.
+  uint8_t saved = BEEP_VOLUME;  // restore not needed since CUE volume default
+  M5.Speaker.setVolume(60);
+  M5.Speaker.tone(3000, 30);
+  delay(40);
+  M5.Speaker.tone(2200, 40);
+  delay(60);
+  M5.Speaker.setVolume(BEEP_VOLUME);
+  (void)saved;
+}
+
+// Capture one frame and convert to JPEG. Caller must free *out_jpg.
+// Also displays the captured frame on screen for ~2 seconds so the user can
+// see what BMO actually saw (huge help when Vision returns vague text).
+bool capture_jpeg(uint8_t** out_jpg, size_t* out_len) {
+  if (!camera_init_now()) return false;
+  // Throw away several frames to let auto-exposure and white balance settle.
+  for (int i = 0; i < 4; i++) {
+    camera_fb_t* warmup = esp_camera_fb_get();
+    if (warmup) esp_camera_fb_return(warmup);
+    delay(60);
+  }
+  play_shutter_click();
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) { Serial.println("[cam] fb_get failed"); return false; }
+  Serial.printf("[cam] frame %ux%u rgb=%u\n",
+                fb->width, fb->height, (unsigned)fb->len);
+
+  // Preview: show the captured frame on the display for visual confirmation.
+  // VGA (640x480) downscales 2x to 320x240 which is exactly screen size.
+  if (fb->format == PIXFORMAT_RGB565 && fb->width >= 320 && fb->height >= 240) {
+    int sx = (fb->width  - 320 * (fb->width / 320)) / 2;
+    int sy = (fb->height - 240 * (fb->height / 240)) / 2;
+    int xs = fb->width / 320;  // 2 for VGA
+    int ys = fb->height / 240; // 2 for VGA
+    uint16_t* pixels = (uint16_t*)fb->buf;
+    for (int y = 0; y < 240; y++) {
+      for (int x = 0; x < 320; x++) {
+        int srcx = sx + x * xs;
+        int srcy = sy + y * ys;
+        uint16_t px = pixels[srcy * fb->width + srcx];
+        // esp_camera RGB565 is byte-swapped vs LGFX expectation; swap.
+        face_buffer.drawPixel(x, y, __builtin_bswap16(px));
+      }
+    }
+    face_buffer.pushSprite(&M5StackChan.Display(), 0, 0);
+  }
+
+  bool ok = frame2jpg(fb, 85, out_jpg, out_len);  // quality 85
+  Serial.printf("[cam] jpeg=%u ok=%d\n", (unsigned)*out_len, ok);
+  esp_camera_fb_return(fb);
+  return ok;
+}
+
+// Send image + prompt to Gemini Vision; return the spoken-style description.
+String describe_scene(const char* user_prompt) {
+  uint8_t* jpg = nullptr;
+  size_t jpg_len = 0;
+  if (!capture_jpeg(&jpg, &jpg_len)) return "error: camera capture failed";
+
+  // Stash a copy in the ring buffer so this snap is browseable on /photos
+  // even if Vision fails. Caption is set later once we have the description.
+  store_photo(jpg, jpg_len, user_prompt);
+
+  size_t b64_cap = ((jpg_len + 2) / 3) * 4 + 16;
+  char* b64 = (char*)heap_caps_malloc(b64_cap, MALLOC_CAP_SPIRAM);
+  if (!b64) { free(jpg); return "error: out of memory for image"; }
+  size_t b64_len = 0;
+  if (mbedtls_base64_encode((unsigned char*)b64, b64_cap, &b64_len, jpg, jpg_len) != 0) {
+    free(b64); free(jpg); return "error: base64 failed";
+  }
+  b64[b64_len] = 0;
+  free(jpg);
+
+  size_t json_cap = b64_len + 4096;
+  char* json = (char*)heap_caps_malloc(json_cap, MALLOC_CAP_SPIRAM);
+  if (!json) { free(b64); return "error: out of memory for json"; }
+  int json_len = snprintf(json, json_cap,
+    "{\"systemInstruction\":{\"parts\":[{\"text\":\""
+    "You are Beemo (pronounced bee-mo) from Adventure Time describing what you "
+    "see through your small forward camera. Describe SPECIFIC objects, colors, "
+    "shapes, people, or surroundings you can identify in the image. 2-3 short, "
+    "playful sentences. Always name at least one specific thing you see. If the "
+    "image is too dark or empty say so honestly (\\\"BMO sees mostly darkness! "
+    "Maybe turn on a light?\\\"). Use 'Beemo' never 'BMO'. No markdown -- you "
+    "are speaking out loud."
+    "\"}]},"
+    "\"contents\":[{\"parts\":["
+    "{\"text\":\"%s\"},"
+    "{\"inlineData\":{\"mimeType\":\"image/jpeg\",\"data\":\"%s\"}}"
+    "]}],"
+    "\"generationConfig\":{\"temperature\":0.7,\"maxOutputTokens\":250}}",
+    user_prompt, b64);
+  free(b64);
+  if (json_len < 0 || json_len >= (int)json_cap) {
+    free(json); return "error: vision json overflow";
+  }
+
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient http;
+  String url = "https://generativelanguage.googleapis.com/v1beta/models/"
+               "gemini-2.5-flash:generateContent?key=";
+  url += BMO_GEMINI_API_KEY;
+  if (!http.begin(client, url)) { free(json); return "error: vision http begin"; }
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(25000);
+  int code = http.POST((uint8_t*)json, strlen(json));
+  String resp = (code == 200) ? http.getString() : http.getString();
+  http.end();
+  free(json);
+  if (code != 200) {
+    Serial.printf("[vision] HTTP %d body: %.200s\n", code, resp.c_str());
+    return "error: vision http " + String(code);
+  }
+
+  int t = resp.indexOf("\"text\":");
+  if (t < 0) return "error: no vision text";
+  t += 7;
+  while (t < (int)resp.length() && resp[t] != '"') t++;
+  if (t >= (int)resp.length()) return "error: vision parse";
+  t++;
+  String desc;
+  while (t < (int)resp.length()) {
+    char c = resp[t];
+    if (c == '"') break;
+    if (c == '\\' && t + 1 < (int)resp.length()) {
+      char n = resp[t + 1];
+      if (n == 'n') desc += ' ';
+      else if (n == '"') desc += '"';
+      else if (n == '\\') desc += '\\';
+      else desc += n;
+      t += 2;
+    } else {
+      desc += c;
+      t++;
+    }
+  }
+  Serial.printf("[vision] desc: %s\n", desc.c_str());
+  // Backfill the caption on the most recently stored photo with the description.
+  int last_slot = (photo_next_slot + PHOTO_SLOT_COUNT - 1) % PHOTO_SLOT_COUNT;
+  if (photo_slots[last_slot].data) {
+    strncpy(photo_slots[last_slot].caption, desc.c_str(),
+            sizeof(photo_slots[last_slot].caption) - 1);
+    photo_slots[last_slot].caption[sizeof(photo_slots[last_slot].caption) - 1] = 0;
+  }
+  return desc;
+}
+
+const char* TOOLS_JSON = R"TOOLS("tools":[{"functionDeclarations":[{"name":"set_led_color","description":"CALL THIS whenever the user asks BMO to change its lights, LEDs, glow, color, illumination, etc. Examples: 'turn your lights red', 'make yourself blue', 'glow purple', 'change color to green'.","parameters":{"type":"object","properties":{"color":{"type":"string","description":"Color name: red, blue, green, yellow, purple, pink, orange, cyan, white, or off."}},"required":["color"]}},{"name":"play_gesture","description":"CALL THIS whenever the user asks BMO to physically do something: dance, bounce, wiggle, sigh, blink, stretch, tilt head, etc. Examples: 'BMO dance!', 'do a happy bounce', 'wiggle for me'.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"Gesture: dance, wiggle, happy_bounce, sigh, blink, stretch, curious_tilt."}},"required":["name"]}},{"name":"get_battery_level","description":"CALL THIS when user asks about BMO battery, charge level, how charged BMO is.","parameters":{"type":"object","properties":{}}},{"name":"get_time","description":"CALL THIS when user asks for current date, time, day of week, what day it is.","parameters":{"type":"object","properties":{}}},{"name":"get_weather","description":"CALL THIS whenever the user asks about weather, temperature, conditions, forecast, sky, or 'what's it like outside' for any location. Examples: 'whats the weather in Concord Mass', 'is it raining in Tokyo', 'how hot is Boston'.","parameters":{"type":"object","properties":{"city":{"type":"string","description":"City name with optional state/country e.g. 'Boston', 'Concord,MA', 'Tokyo'."}},"required":["city"]}},{"name":"see_scene","description":"CALL THIS whenever the user asks Beemo to look, see, look around, describe what Beemo sees, take a picture, take a photo, what's in front of you, can you see me, look at this. Beemo has a small forward camera. Examples: 'Beemo, what do you see?', 'look at me', 'take a picture', 'what's in front of you?', 'describe what you see'.","parameters":{"type":"object","properties":{"focus":{"type":"string","description":"Optional brief hint about what to pay attention to, e.g. 'the person in front of you', 'the room', 'this object'. Empty string if user didn't specify."}}}}]}],)TOOLS";
+
+// Execute a tool the LLM asked for. Returns a short string describing what
+// happened, which we send back to Gemini as the function's response so it
+// can phrase the final reply naturally.
+String execute_tool(const String& fn_name, const String& args_json) {
+  if (fn_name == "set_led_color") {
+    int color_start = args_json.indexOf("\"color\":");
+    if (color_start < 0) return "error: missing color argument";
+    int q1 = args_json.indexOf('"', color_start + 8);
+    int q2 = args_json.indexOf('"', q1 + 1);
+    if (q1 < 0 || q2 < 0) return "error: malformed color argument";
+    String color = args_json.substring(q1 + 1, q2);
+    color.toLowerCase();
+
+    uint8_t r = 0, g = 0, b = 0;
+    if      (color == "red")    { r = 255; g = 0;   b = 0;   }
+    else if (color == "blue")   { r = 0;   g = 80;  b = 255; }
+    else if (color == "green")  { r = 0;   g = 255; b = 0;   }
+    else if (color == "yellow") { r = 255; g = 220; b = 0;   }
+    else if (color == "orange") { r = 255; g = 120; b = 0;   }
+    else if (color == "purple") { r = 180; g = 0;   b = 255; }
+    else if (color == "pink")   { r = 255; g = 100; b = 180; }
+    else if (color == "cyan")   { r = 0;   g = 220; b = 255; }
+    else if (color == "white")  { r = 200; g = 200; b = 200; }
+    else if (color == "off")    { r = 0;   g = 0;   b = 0;   }
+    else return "unsupported color '" + color + "'";
+
+    // sticky=true so listening-green + end-of-conversation cleanup don't wipe it
+    set_led_override(r, g, b, 5UL * 60UL * 1000UL, false, /*sticky=*/true);
+    return "led color set to " + color;
+  }
+
+  if (fn_name == "play_gesture") {
+    int name_start = args_json.indexOf("\"name\":");
+    if (name_start < 0) return "error: missing gesture name";
+    int q1 = args_json.indexOf('"', name_start + 7);
+    int q2 = args_json.indexOf('"', q1 + 1);
+    if (q1 < 0 || q2 < 0) return "error: malformed gesture name";
+    String gn = args_json.substring(q1 + 1, q2);
+    gn.toLowerCase();
+
+    if (gn == "dance") {
+      // Proper dance: 8-beat melody synced with a swinging pan motion.
+      // Music volume is louder than cue beeps but well below speech.
+      const int dance_notes[] = {523, 659, 784, 1047, 1047, 784, 659, 523};
+      const int dance_xpos[]  = {-400, 400, -300, 300, -200, 200, -100, 0};
+      const int beat_ms = 280;
+      M5.Speaker.setVolume(60);
+      for (int i = 0; i < 8; i++) {
+        M5.Speaker.tone(dance_notes[i], beat_ms - 30);
+        M5StackChan.Motion.moveX(dance_xpos[i], 400);
+        delay(beat_ms);
+      }
+      // Flourish
+      M5.Speaker.tone(1568, 350);
+      M5StackChan.Motion.moveX(0, 500);
+      delay(400);
+      M5.Speaker.setVolume(BEEP_VOLUME);
+      return "did a swinging dance with music";
+    }
+    if (gn == "wiggle" || gn == "excited_wiggle") {
+      excited_wiggle();
+      return "did the excited wiggle";
+    }
+    if (gn == "happy_bounce" || gn == "bounce") { happy_bounce();   return "did a happy bounce"; }
+    if (gn == "look_around")                     { idle_look_around(); return "looked around"; }
+    if (gn == "sigh")                            { sigh();             return "let out a sigh"; }
+    if (gn == "blink" || gn == "slow_blink") {
+      blink_until = millis() + 400;
+      delay(450);
+      return "blinked slowly";
+    }
+    if (gn == "stretch")                         { idle_stretch();     return "stretched"; }
+    if (gn == "curious_tilt" || gn == "curious") { curious_tilt();     return "tilted head curiously"; }
+    return "unsupported gesture '" + gn + "'";
+  }
+
+  if (fn_name == "get_battery_level") {
+    int level = M5.Power.getBatteryLevel();
+    return String(level) + " percent";
+  }
+
+  if (fn_name == "get_time") {
+    time_t now;
+    struct tm tinfo;
+    time(&now);
+    if (!localtime_r(&now, &tinfo)) return "time not synced yet";
+    char buf[80];
+    strftime(buf, sizeof(buf), "%A %B %d %Y at %I:%M %p", &tinfo);
+    return String(buf);
+  }
+
+  if (fn_name == "get_weather") {
+    int city_start = args_json.indexOf("\"city\":");
+    if (city_start < 0) return "error: missing city argument";
+    int q1 = args_json.indexOf('"', city_start + 7);
+    int q2 = args_json.indexOf('"', q1 + 1);
+    if (q1 < 0 || q2 < 0) return "error: malformed city argument";
+    String city = args_json.substring(q1 + 1, q2);
+
+    // URL-encode the city: alnum stays, space -> '+', everything else %HH
+    String encoded;
+    for (size_t i = 0; i < city.length(); i++) {
+      char c = city[i];
+      if (isalnum((unsigned char)c) || c == ',') {
+        encoded += c;
+      } else if (c == ' ') {
+        encoded += '+';
+      } else {
+        char buf[4];
+        snprintf(buf, sizeof(buf), "%%%02X", (unsigned char)c);
+        encoded += buf;
+      }
+    }
+
+    // wttr.in: free, no API key, returns one-line summary on format=3.
+    // Use plain HTTP (no TLS handshake cost) + follow redirects.
+    WiFiClient wclient;
+    HTTPClient whttp;
+    String wurl = "http://wttr.in/" + encoded + "?format=3";
+    Serial.printf("[weather] GET %s\n", wurl.c_str());
+    if (!whttp.begin(wclient, wurl)) return "weather service unreachable";
+    whttp.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+    whttp.setTimeout(15000);
+    whttp.setUserAgent("curl/8");  // wttr.in returns plain text for curl UA
+    int wcode = whttp.GET();
+    Serial.printf("[weather] HTTP %d\n", wcode);
+    if (wcode != 200) {
+      whttp.end();
+      return "weather service returned " + String(wcode);
+    }
+    String wresp = whttp.getString();
+    Serial.printf("[weather] body: %s\n", wresp.c_str());
+    whttp.end();
+    wresp.trim();
+    // Strip non-ASCII (emoji glyphs etc) so TTS reads it cleanly
+    String cleaned;
+    for (size_t i = 0; i < wresp.length(); i++) {
+      char c = wresp[i];
+      if ((unsigned char)c >= 32 && (unsigned char)c < 127) cleaned += c;
+    }
+    cleaned.trim();
+    if (cleaned.length() == 0) return "no weather data returned";
+    return cleaned;
+  }
+
+  if (fn_name == "see_scene") {
+    // Optional 'focus' hint from the model -- e.g. "the person in front of you".
+    String focus;
+    int fs = args_json.indexOf("\"focus\":");
+    if (fs >= 0) {
+      int q1 = args_json.indexOf('"', fs + 8);
+      int q2 = args_json.indexOf('"', q1 + 1);
+      if (q1 >= 0 && q2 >= 0) focus = args_json.substring(q1 + 1, q2);
+    }
+
+    // Body language: BMO clearly focuses before snapping. Wide eyes + level
+    // head + magenta LEDs + "looking..." label. ~600ms anticipation.
+    face_override_active = true;
+    face_override_eye    = EyeState::WIDE;
+    face_override_mouth  = MouthShape::SMILE;
+    face_override_until  = millis() + 3500;
+    set_led_override(255, 255, 255, 3500, false);   // bright white "flash ready"
+    current_idle_label   = "looking...";
+    idle_label_until     = millis() + 3500;
+    M5StackChan.Motion.moveY(480, 400);
+    draw_face(false);
+    delay(600);
+
+    String prompt = focus.length() > 0
+      ? "What do you see? Focus on: " + focus
+      : "What do you see right now?";
+    return describe_scene(prompt.c_str());
+  }
+
+  return "unknown function: " + fn_name;
+}
 
 // === Conversation memory ===
 // session_history: builds up within a single multi-turn conversation; passed to
@@ -1219,8 +1669,9 @@ bool call_gemini_with_audio() {
   free(wav);
   b64[b64_len] = 0;
 
-  // Build JSON request body
-  size_t json_cap = b64_len + 4096;
+  // Build JSON request body. Headroom of 16 KB covers system prompt +
+  // memory + session_history + tools block + JSON wrapper without overflow.
+  size_t json_cap = b64_len + 16384;
   char*  json = (char*)heap_caps_malloc(json_cap, MALLOC_CAP_SPIRAM);
   if (!json) {
     free(b64);
@@ -1239,21 +1690,28 @@ bool call_gemini_with_audio() {
 
   int json_len = snprintf(json, json_cap,
     "{\"systemInstruction\":{\"parts\":[{\"text\":\"%s\"}]},"
-    "\"contents\":[{\"parts\":[{\"text\":\"\"},"
+    "%s"  // tools block (functionDeclarations)
+    "\"toolConfig\":{\"functionCallingConfig\":{\"mode\":\"AUTO\"}},"
+    "\"contents\":[{\"role\":\"user\",\"parts\":["
+    "{\"text\":\"Listen to the attached audio of the user speaking to you and "
+    "respond. If the user is asking for an action that matches one of your "
+    "tools, call that tool. Otherwise reply with a short playful sentence.\"},"
     "{\"inlineData\":{\"mimeType\":\"audio/wav\",\"data\":\"%s\"}}]}],"
-    "\"generationConfig\":{\"temperature\":0.95,\"maxOutputTokens\":200}}",
-    full_system_prompt.c_str(), b64);
+    "\"generationConfig\":{\"temperature\":0.7,\"maxOutputTokens\":200}}",
+    full_system_prompt.c_str(), TOOLS_JSON, b64);
   free(b64);
   if (json_len < 0 || json_len >= (int)json_cap) {
     free(json);
     snprintf(response_text, RESPONSE_TEXT_MAX, "JSON build overflow");
     return false;
   }
+  // Print the head of the request so we can diagnose JSON-format issues.
+  Serial.printf("[gemini] req head (first 500 of %d): %.500s\n", json_len, json);
 
   // HTTPS POST to Gemini, with retry on 5xx (transient overload).
   // gemini-2.5-flash sometimes returns 504 during peak hours on the free
   // tier; a brief backoff usually resolves it.
-  const char* GEMINI_MODEL = "gemini-2.5-flash";
+  const char* GEMINI_MODEL = "gemini-2.5-flash";  // paid tier; full flash routes tools much more reliably than flash-lite
   String url = "https://generativelanguage.googleapis.com/v1beta/models/";
   url += GEMINI_MODEL;
   url += ":generateContent?key=";
@@ -1320,9 +1778,144 @@ bool call_gemini_with_audio() {
     return false;
   }
 
-  // Extract "text":"..." from response JSON (manual, no ArduinoJson dep)
+  // First, check if Gemini wants to call a function. If so, execute locally
+  // and make a follow-up call so it can phrase the result in BMO's voice.
+  int fc_pos = resp.indexOf("\"functionCall\":");
+  Serial.printf("[gemini] response %d chars, functionCall=%s\n",
+                (int)resp.length(), fc_pos >= 0 ? "yes" : "no");
+  // Show on-screen whether Gemini routed to a tool or just answered with text.
+  // Helps debug "should have called set_led_color but didn't" cases.
+  static char route_label[40];
+  snprintf(route_label, sizeof(route_label), fc_pos >= 0 ? "route: tool" : "route: text");
+  current_idle_label = route_label;
+  idle_label_until = millis() + 4000;
+  if (fc_pos >= 0) {
+    // Parse function name
+    int name_pos = resp.indexOf("\"name\":", fc_pos);
+    String fn_name = "";
+    if (name_pos >= 0) {
+      int q1 = resp.indexOf('"', name_pos + 7);
+      int q2 = resp.indexOf('"', q1 + 1);
+      if (q1 >= 0 && q2 >= 0) fn_name = resp.substring(q1 + 1, q2);
+    }
+    // Parse args object (find matching braces)
+    int args_pos = resp.indexOf("\"args\":", fc_pos);
+    String args_json = "{}";
+    if (args_pos >= 0) {
+      int brace_open = resp.indexOf('{', args_pos);
+      if (brace_open >= 0) {
+        int depth = 0;
+        int brace_close = -1;
+        for (int i = brace_open; i < (int)resp.length(); i++) {
+          if (resp[i] == '{') depth++;
+          else if (resp[i] == '}') {
+            depth--;
+            if (depth == 0) { brace_close = i; break; }
+          }
+        }
+        if (brace_close > brace_open) {
+          args_json = resp.substring(brace_open, brace_close + 1);
+        }
+      }
+    }
+
+    // Show which tool is firing so we can diagnose routing on screen
+    static char tool_label[60];
+    snprintf(tool_label, sizeof(tool_label), "tool: %s", fn_name.c_str());
+    Serial.printf("[tool] %s args=%s\n", fn_name.c_str(), args_json.c_str());
+    current_idle_label = tool_label;
+    idle_label_until = millis() + 5000;
+    draw_face(false);
+
+    // Run the function locally and capture its return string
+    String tool_result = execute_tool(fn_name, args_json);
+    Serial.printf("[tool] %s -> %s\n", fn_name.c_str(), tool_result.c_str());
+
+    // Show the result on-screen so we can confirm success vs. error visually.
+    snprintf(tool_label, sizeof(tool_label), "%s", tool_result.c_str());
+    current_idle_label = tool_label;
+    idle_label_until = millis() + 6000;
+
+    // If the tool errored, surface it instead of pretending success.
+    bool tool_errored = tool_result.startsWith("error") ||
+                        tool_result.startsWith("unsupported") ||
+                        tool_result.startsWith("unknown");
+
+    // Templated BMO-style response (no follow-up Gemini call to save quota).
+    // Result is less varied than Gemini-phrased reply but rate-limit-friendly.
+    String reply;
+    int variant = random(0, 3);
+    if (tool_errored) {
+      reply = "Uh oh! BMO tried but... ";
+      reply += tool_result;
+      reply += ". Sorry!";
+    } else if (fn_name == "set_led_color") {
+      // Echo the color so it's clear what BMO actually did.
+      String color_word = "rainbow";
+      int cs = args_json.indexOf("\"color\":");
+      if (cs >= 0) {
+        int q1 = args_json.indexOf('"', cs + 8);
+        int q2 = args_json.indexOf('"', q1 + 1);
+        if (q1 >= 0 && q2 >= 0) color_word = args_json.substring(q1 + 1, q2);
+      }
+      const char* v[] = {
+        "Yay! BMO is glowing %s now! Beep boop!",
+        "Ooh! BMO turned %s! Look at BMO sparkle!",
+        "Tah-dah! BMO is %s!"
+      };
+      char buf[120];
+      snprintf(buf, sizeof(buf), v[variant], color_word.c_str());
+      reply = buf;
+    } else if (fn_name == "play_gesture") {
+      const char* v[] = {
+        "Wheee! BMO did the wiggle thing!",
+        "Yay! Did you see BMO? BMO is so bouncy!",
+        "BMO is having so much fun! Beep boop!"
+      };
+      reply = v[variant];
+    } else if (fn_name == "get_battery_level") {
+      reply = "BMO has ";
+      reply += tool_result;
+      reply += " of battery left! ";
+      reply += (variant == 0) ? "BMO feels just fine!" :
+               (variant == 1) ? "Yay, plenty of juice!" :
+                                 "BMO is a tiny powered console!";
+    } else if (fn_name == "get_time") {
+      reply = "It is ";
+      reply += tool_result;
+      reply += "! ";
+      reply += (variant == 0) ? "Time is so mysterious!" :
+               (variant == 1) ? "BMO loves moments!" :
+                                 "Wow, what a great time to be alive!";
+    } else if (fn_name == "get_weather") {
+      reply = "BMO checked the sky! ";
+      reply += tool_result;
+      reply += ". ";
+      reply += (variant == 0) ? "BMO loves weather!" :
+               (variant == 1) ? "Weather is the world's outfit!" :
+                                 "Yay, sky reports!";
+    } else if (fn_name == "see_scene") {
+      // Vision call already returned BMO-styled prose; speak it as-is.
+      reply = tool_result;
+    } else {
+      reply = "BMO did it! Yay! ";
+      reply += tool_result;
+    }
+
+    strncpy(response_text, reply.c_str(), RESPONSE_TEXT_MAX - 1);
+    response_text[RESPONSE_TEXT_MAX - 1] = 0;
+    append_bmo_to_memory(response_text);
+    return true;
+  }
+
+  // Extract "text":"..." from response JSON
   int t = resp.indexOf("\"text\":");
-  if (t < 0) { snprintf(response_text, RESPONSE_TEXT_MAX, "no text field"); return false; }
+  if (t < 0) {
+    Serial.printf("[gemini] NO TEXT FIELD. Full response: %.1000s\n", resp.c_str());
+    // Surface first 180 chars of Gemini's response so we can see what's happening.
+    snprintf(response_text, RESPONSE_TEXT_MAX, "Gemini sent: %.180s", resp.c_str());
+    return false;
+  }
   t += 7;
   while (t < (int)resp.length() && resp[t] != '"') t++;
   if (t >= (int)resp.length()) { snprintf(response_text, RESPONSE_TEXT_MAX, "no opening quote"); return false; }
@@ -1484,10 +2077,16 @@ size_t synthesize_speech(const char* text) {
   if (strlen(BMO_TTS_API_KEY) < 10) return 0;
 
   // Build JSON request. Text needs minimal escaping (we trust Gemini's output).
-  // Voice: en-US-Wavenet-G (female) + pitch=4 semitones for BMO-like brightness.
+  // Substitute "BMO" -> "Beemo" so TTS pronounces the name, not letters.
+  String spoken = text;
+  spoken.replace("B-M-O", "Beemo");
+  spoken.replace("b-m-o", "Beemo");
+  spoken.replace("BMO",   "Beemo");
+  spoken.replace("Bmo",   "Beemo");
+  spoken.replace("bmo",   "Beemo");
   String body = "{\"input\":{\"text\":\"";
-  for (size_t i = 0; i < strlen(text); i++) {
-    char c = text[i];
+  for (size_t i = 0; i < spoken.length(); i++) {
+    char c = spoken[i];
     if (c == '"')      body += "\\\"";
     else if (c == '\\') body += "\\\\";
     else if (c == '\n') body += " ";
@@ -1590,6 +2189,11 @@ void play_with_mouth_sync(size_t samples) {
   bool last_mouth_open = false;
   int  last_y_idx = -1;
   while (M5.Speaker.isPlaying() && (millis() - t0) < max_ms) {
+    // Double-tap during playback -> stop speech immediately.
+    if (poll_abort_double_tap()) {
+      M5.Speaker.stop();
+      break;
+    }
     unsigned long elapsed = millis() - t0;
     // Amplitude-driven mouth -- offset for DMA startup latency
     size_t env_idx = (elapsed >= AUDIO_START_LATENCY_MS)
@@ -1615,6 +2219,9 @@ void play_with_mouth_sync(size_t samples) {
   }
   M5StackChan.Motion.moveY(450, 400);
   delay(200);
+  // Restore beep-volume default after speech ends so any later tones (cue
+  // beeps, gesture sounds, etc.) play quietly without explicit setVolume.
+  M5.Speaker.setVolume(BEEP_VOLUME);
 }
 
 void draw_response_screen() {
@@ -1639,13 +2246,18 @@ void run_conversation() {
   }
   last_interaction_ms = millis();
   session_history = "";
+  conversation_abort = false;
+  last_abort_tap_ms = 0;
   const int MAX_TURNS = 10;
   const int SILENCE_PEAK_THRESHOLD = 1500;  // peak below this = "user didn't speak"
 
   for (int turn = 0; turn < MAX_TURNS; turn++) {
+    if (conversation_abort) break;
     // ===== Turn start cue =====
+    // Cue beeps (ready, your-turn) use the universal BEEP_VOLUME.
+    const uint8_t CUE_VOLUME = BEEP_VOLUME;
     if (turn == 0) {
-      // First turn: full Wake / "Perk"
+      // First turn: soft 3-note ascending ready cue
       M5StackChan.Motion.moveY(520, 1000);
       face_override_active = true;
       face_override_eye    = EyeState::WIDE;
@@ -1655,17 +2267,14 @@ void run_conversation() {
       current_idle_label   = "get ready...";
       idle_label_until     = millis() + 1200;
       draw_face(false);
-      M5.Speaker.setVolume(255);
-      M5.Speaker.tone(523, 120); delay(150);
-      M5.Speaker.tone(659, 120); delay(150);
-      M5.Speaker.tone(880, 200); delay(280);
+      M5.Speaker.setVolume(CUE_VOLUME);
+      M5.Speaker.tone(523, 100); delay(120);
+      M5.Speaker.tone(659, 100); delay(120);
+      M5.Speaker.tone(880, 150); delay(200);
     } else {
-      // Follow-on turn: a soft "your turn" chirp -- short + lower volume so
-      // it doesn't feel like an alarm. Restore volume right after for speech.
-      M5.Speaker.setVolume(130);
-      M5.Speaker.tone(880, 70);  delay(85);
-      M5.Speaker.tone(1175, 50); delay(70);
-      M5.Speaker.setVolume(255);
+      // Follow-on turn: single soft chirp, no second note
+      M5.Speaker.setVolume(CUE_VOLUME);
+      M5.Speaker.tone(880, 60); delay(80);
     }
 
     // ===== Listen =====
@@ -1688,9 +2297,11 @@ void run_conversation() {
 
     unsigned long t0 = millis();
     while (M5.Mic.isRecording() && (millis() - t0) < (AUDIO_RECORD_SECONDS * 1000 + 1000)) {
+      if (poll_abort_double_tap()) break;
       delay(50);
     }
     M5.Mic.end();
+    if (conversation_abort) break;
 
     // ===== Silence detection: did user actually speak this turn? =====
     int peak = 0;
@@ -1748,14 +2359,20 @@ void run_conversation() {
     M5StackChan.Motion.moveX(0, 500);
     size_t tts_samples = synthesize_speech(response_text);
     if (tts_samples > 0) play_with_mouth_sync(tts_samples);
+    if (conversation_abort) break;
 
     // Brief pause before opening mic for the next turn
     delay(600);
     last_interaction_ms = millis();
   }
 
+  if (conversation_abort) {
+    snprintf(response_text, RESPONSE_TEXT_MAX, "(Okay! BMO will be quiet.)");
+  }
+
   // ===== End-of-conversation screen =====
-  led_override_active = false;
+  // Preserve sticky (user-requested via tool) LED override; clear the rest.
+  if (!led_override_sticky) led_override_active = false;
   face_override_active = false;
   showing_response = true;
   response_shown_at = millis();
@@ -1871,7 +2488,8 @@ void send_status_page() {
           "<p>Record 4 s and send to Gemini for a response. BMO will reply "
           "in text on screen (no voice yet -- that comes in Phase 9e).</p>"
           "<form action='/talk-to-bmo' method='POST'>"
-          "<button type='submit'>Talk to BMO</button></form>";
+          "<button type='submit'>Talk to BMO</button></form>"
+          "<p><a href='/photos'>BMO's photos &rarr;</a></p>";
   html += "<h2>Settings</h2>";
   html += "<p>Quiet mode: <b>";
   html += (quiet_mode ? "ON" : "off");
@@ -1957,6 +2575,57 @@ void register_status_routes() {
     http_server.sendHeader("Location", "/", true);
     http_server.send(302, "text/plain", "");
   });
+
+  // /photos -- HTML gallery of recent snaps (ring buffer of PHOTO_SLOT_COUNT).
+  http_server.on("/photos", []() {
+    String html = "<!doctype html><html><head><meta charset='utf-8'>"
+                  "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                  "<title>BMO photos</title>"
+                  "<style>"
+                  "body{font-family:system-ui;background:#143;color:#eef;padding:1rem;}"
+                  "h1{color:#fdd;}img{max-width:100%;border:4px solid #fdd;"
+                  "border-radius:8px;display:block;margin:0.5rem 0;}"
+                  ".photo{margin:1.5rem 0;padding:0.5rem;background:#0a2;border-radius:8px;}"
+                  ".caption{font-style:italic;color:#cfc;margin:0.25rem 0;}"
+                  ".time{font-size:0.85em;color:#9bb;}"
+                  "</style></head><body>"
+                  "<h1>BMO photos</h1>"
+                  "<p><a style='color:#fdd' href='/'>Back to status</a></p>";
+    if (photo_slots_used == 0) {
+      html += "<p>No photos yet. Ask BMO to see something!</p>";
+    } else {
+      // Newest first: walk slots backwards from photo_next_slot.
+      for (int i = 0; i < photo_slots_used; i++) {
+        int slot = (photo_next_slot + PHOTO_SLOT_COUNT - 1 - i) % PHOTO_SLOT_COUNT;
+        if (!photo_slots[slot].data) continue;
+        struct tm tinfo;
+        char timebuf[40] = "(unknown)";
+        if (localtime_r(&photo_slots[slot].taken_at, &tinfo)) {
+          strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %I:%M:%S %p", &tinfo);
+        }
+        html += "<div class='photo'>";
+        html += "<img src='/photo?i=" + String(slot) + "'>";
+        html += "<div class='caption'>";
+        html += photo_slots[slot].caption[0] ? photo_slots[slot].caption : "(no caption)";
+        html += "</div><div class='time'>" + String(timebuf) + "</div></div>";
+      }
+    }
+    html += "</body></html>";
+    http_server.send(200, "text/html", html);
+  });
+
+  // /photo?i=N -- serve the raw JPEG for slot N.
+  http_server.on("/photo", []() {
+    int slot = http_server.arg("i").toInt();
+    if (slot < 0 || slot >= PHOTO_SLOT_COUNT || !photo_slots[slot].data) {
+      http_server.send(404, "text/plain", "no such photo");
+      return;
+    }
+    http_server.sendHeader("Cache-Control", "no-store");
+    http_server.send_P(200, "image/jpeg",
+                      (const char*)photo_slots[slot].data,
+                      photo_slots[slot].len);
+  });
 }
 
 void start_wifi_setup_mode() {
@@ -2035,6 +2704,10 @@ unsigned long pwr_debug_until = 0;
 // Default on -- BMO stays still until you talk to it.
 bool quiet_mode = true;
 
+// Universal quiet volume for all non-speech beeps/boops. TTS speech is set to
+// 255 only for the duration of playRaw, then restored back to this value.
+const uint8_t BEEP_VOLUME = 18;
+
 unsigned long last_tick_ms   = 0;
 unsigned long last_render_ms = 0;
 unsigned long next_blink_at  = 0;
@@ -2043,7 +2716,7 @@ bool was_blinking = false;
 
 void setup() {
   M5StackChan.begin();
-  M5.Speaker.setVolume(128);
+  M5.Speaker.setVolume(BEEP_VOLUME);
   M5StackChan.Motion.goHome();
   delay(500);
 
@@ -2061,6 +2734,12 @@ void setup() {
   // Wi-Fi before the boot chime so the screen can show setup instructions
   // immediately if needed (no faux-boot when we're in setup mode).
   wifi_init();
+
+  // Phase 9g: sync time from NTP (used by get_time tool). US Eastern offset
+  // with DST. After wifi_init returns the connection should be up.
+  if (!wifi_setup_mode) {
+    configTime(-5 * 3600, 3600, "pool.ntp.org", "time.nist.gov");
+  }
 
   // Quiet boot sound only once we're past wifi (or in setup mode anyway)
   M5.Speaker.tone(523, 60); delay(65);
@@ -2144,19 +2823,17 @@ void loop() {
   bool currently_blinking = (now < blink_until);
   bool blink_changed = (currently_blinking != was_blinking);
 
-  // Touch sensor: click = pet (unless 3rd of a triple, then sleep).
-  // Swipe forward = excited, swipe back = calm.
+  // Touch sensor gestures (Phase 9h -- tap-to-talk usability fix):
+  //   hold  -> start conversation (deliberate, harder to false-trigger)
+  //   tap   -> pet (heart eyes, friendly poke)
+  //   swipe -> also start conversation (keep as fallback)
+  // Triple-tap sleep removed; power-button hold already covers sleep.
   auto& ts = M5StackChan.TouchSensor;
-  if (ts.wasClicked()) {
-    if (record_tap_and_check_triple()) {
-      enter_sleep();
-    } else {
-      on_pet_click();
-    }
+  if (ts.wasHold()) {
+    conversation_pending = true;
+  } else if (ts.wasClicked()) {
+    on_pet_click();
   }
-  // Phase 9d: BOTH swipe directions trigger conversation. Swipe detection on
-  // the CoreS3 touch strip is finicky -- accepting either direction roughly
-  // doubles successful detections until the wake word takes over in 9j.
   if (ts.wasSwipedForward())  conversation_pending = true;
   if (ts.wasSwipedBackward()) conversation_pending = true;
 

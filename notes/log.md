@@ -6,7 +6,31 @@ Newest entries on top. After every working session, append a new block: what we 
 
 ## NEXT SESSION — RESUME HERE
 
-> Pinned section. Read this first when you come back. Last updated 2026-05-19, end of session that built Phase 9a (local hardware features) + Phase 9b (Wi-Fi provisioning).
+> Pinned section. Read this first when you come back. Last updated 2026-05-19, mid-Phase-9g (Gemini tool calling polish).
+
+### Where we left off (this session)
+
+Phase 9g (tool calling) is **mostly working**: `get_time`, `get_weather`, `play_gesture(dance)` all fire and return real results. **`set_led_color` is the open bug** — Gemini now routes to the tool (the on-screen `tool: set_led_color` label flashes), but the LEDs don't visibly change. Just shipped a diagnostic build that:
+- Speaks the actual color name back ("BMO turned orange") instead of generic "Yay glowing!"
+- Shows the tool result string on-screen for ~6 seconds (e.g. `led color set to orange` or `unsupported color 'X'`)
+- Surfaces errors instead of pretending success.
+
+**Pick up here:** ask "BMO, turn your lights orange" → note (a) what BMO says back, (b) what the on-screen result text says, (c) whether LEDs change. That triangulates whether Gemini is sending a weird color string, whether `set_led_override` is being called but stomped by something I missed, or whether the LED hardware itself isn't getting refreshed.
+
+### Other changes shipped this session
+- Switched Gemini billing to **paid tier** (29-cent flash-lite rate, ~$30 in account). Free-tier 429s should be gone.
+- Switched weather from HTTPS (was returning -1, TLS handshake fail) to plain HTTP with curl UA + redirect-follow. Working now.
+- Added `play_dance()` with C-E-G-C arpeggio + swinging pan motion (was just shaking).
+- Added `led_override_sticky` flag so user-requested LED colors aren't wiped by listening-green-LED or end-of-conversation cleanup.
+- Lowered Gemini temperature 0.95 → 0.7 to push toward deterministic tool routing.
+- Added explicit `toolConfig: {functionCallingConfig: {mode: AUTO}}` to Gemini request.
+- Rewrote system prompt: tool routing is now MANDATORY, with explicit "User: X → CALL tool" examples. Removed the prior "BMO has no time powers" example that was training against tool use.
+- Added `[tool] name args=... -> result` serial logging for routing diagnosis.
+
+### Security TODO — rotate exposed keys
+Both `BMO_GEMINI_API_KEY` and `BMO_TTS_API_KEY` from `firmware/IdleLab/gemini_credentials.h` got pulled into this conversation's context window. They're still **in the local file (gitignored)**, so they never hit git, but they were visible to me. Rotate at https://aistudio.google.com/apikey and update the local file. ~3 min.
+
+### Original Phase 9 status — Phase 9a (local hardware features) + Phase 9b (Wi-Fi provisioning).
 
 ### Where we are (one paragraph)
 
