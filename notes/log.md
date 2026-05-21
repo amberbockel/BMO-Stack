@@ -6,29 +6,91 @@ Newest entries on top. After every working session, append a new block: what we 
 
 ## NEXT SESSION — RESUME HERE
 
-> Pinned section. Read this first when you come back. Last updated 2026-05-19, mid-Phase-9g (Gemini tool calling polish).
+> Pinned section. Read this first when you come back. Last updated 2026-05-20 overnight, after a big push: Phases 9g (tool calling fixed), 9h (UX polish), 9k (camera + Gemini Vision) all landed.
 
-### Where we left off (this session)
+### Where we are (current state, working build)
 
-Phase 9g (tool calling) is **mostly working**: `get_time`, `get_weather`, `play_gesture(dance)` all fire and return real results. **`set_led_color` is the open bug** — Gemini now routes to the tool (the on-screen `tool: set_led_color` label flashes), but the LEDs don't visibly change. Just shipped a diagnostic build that:
-- Speaks the actual color name back ("BMO turned orange") instead of generic "Yay glowing!"
-- Shows the tool result string on-screen for ~6 seconds (e.g. `led color set to orange` or `unsupported color 'X'`)
-- Surfaces errors instead of pretending success.
+Robot is in a great place. Commit `ab6dbdd` on `main`. End-to-end working:
+- **Hold-to-talk** (press and hold touch strip ~½s) → starts conversation. Tap = pet (heart eyes). Swipe = also starts convo (fallback).
+- **Double-tap during conversation** → aborts speech/listening immediately.
+- **Tool routing on `gemini-2.5-flash`** (paid tier): `set_led_color`, `play_gesture(dance)`, `get_time`, `get_weather`, `get_battery_level`, `see_scene` (camera + Vision).
+- **LED color** actually changes the LEDs and persists across conversation turns (sticky override).
+- **"Beemo" pronunciation** via TTS substitution + system prompt instruction.
+- **Photos**: ask "Beemo, what do you see?" → BMO does pre-snap body language (wide eyes, white LEDs, "looking..."), camera shutter click sound, captures VGA frame, shows preview on screen, sends to Gemini Vision, speaks description. Last 5 photos browseable at `http://bmo.local/photos`.
 
-**Pick up here:** ask "BMO, turn your lights orange" → note (a) what BMO says back, (b) what the on-screen result text says, (c) whether LEDs change. That triangulates whether Gemini is sending a weird color string, whether `set_led_override` is being called but stomped by something I missed, or whether the LED hardware itself isn't getting refreshed.
+### Morning tasks (you, ~5-15 min)
 
-### Other changes shipped this session
-- Switched Gemini billing to **paid tier** (29-cent flash-lite rate, ~$30 in account). Free-tier 429s should be gone.
-- Switched weather from HTTPS (was returning -1, TLS handshake fail) to plain HTTP with curl UA + redirect-follow. Working now.
-- Added `play_dance()` with C-E-G-C arpeggio + swinging pan motion (was just shaking).
-- Added `led_override_sticky` flag so user-requested LED colors aren't wiped by listening-green-LED or end-of-conversation cleanup.
-- Lowered Gemini temperature 0.95 → 0.7 to push toward deterministic tool routing.
-- Added explicit `toolConfig: {functionCallingConfig: {mode: AUTO}}` to Gemini request.
-- Rewrote system prompt: tool routing is now MANDATORY, with explicit "User: X → CALL tool" examples. Removed the prior "BMO has no time powers" example that was training against tool use.
-- Added `[tool] name args=... -> result` serial logging for routing diagnosis.
+Order: do these in sequence.
 
-### Security TODO — rotate exposed keys
-Both `BMO_GEMINI_API_KEY` and `BMO_TTS_API_KEY` from `firmware/IdleLab/gemini_credentials.h` got pulled into this conversation's context window. They're still **in the local file (gitignored)**, so they never hit git, but they were visible to me. Rotate at https://aistudio.google.com/apikey and update the local file. ~3 min.
+1. **Read [`notes/wake-word-submission.md`](wake-word-submission.md)** — honest correction of what I told you last session. Espressif's free service isn't really a hobbyist path. Real options: free microWakeWord (community request OR self-train in Colab), or $1k CustomESP-SR. Pick a path. (~5 min to read + pick.)
+2. **If you picked microWakeWord Path A (community request):** post on the HA forum thread linked in the guide. ~5 min including account creation.
+3. **If you picked microWakeWord Path B (Colab self-train):** open the Colab notebook, change wake word to "hey beemo", run all cells. ~15 min to start; training runs unattended for ~3 hours.
+4. **Rotate exposed API keys** (still pending from previous session). https://aistudio.google.com/apikey, update `firmware/IdleLab/gemini_credentials.h`. ~3 min.
+5. **Tell me which path you picked** so I can plan the firmware integration accordingly. The TFLite Micro integration (Path A/B) is different from WakeNet9 (Path C).
+
+### Next session priorities
+
+Pick from this menu (or tell me something else):
+
+- **Photo follow-ups** — quick win: ask "what color was that?" after a photo, BMO remembers the scene from session history. ~15 min.
+- **Selfie mode** — "Beemo, take a selfie" → countdown beeps + snap. ~15 min.
+- **Reactive vision** — every minute or so when idle, BMO quietly comments on what's around it. Big personality boost. ~30 min.
+- **Mini games** — BMO is a video game console; could do number guessing, BMO trivia, simon-says. ~60 min.
+- **Face recognition** — "That's Amber!" learns you over time. Bigger feature. ~2 sessions.
+- **Bedtime/wake routines** — schedule-aware behaviors. ~30 min.
+
+### What I shipped this session (2026-05-19 / 2026-05-20)
+
+Gesture overhaul:
+- **Hold-to-talk** replaces tap-to-talk (taps were getting eaten by the pet/heart-eyes handler).
+- **Double-tap-to-abort** during conversation. Polled from listen loop + playback loop.
+- **Triple-tap-sleep removed** (power-button hold still covers sleep).
+
+LED color tool finally works:
+- Added `led_override_sticky` flag — user-requested colors aren't wiped by listening-green or end-of-conversation cleanup.
+- `set_led_override` now pushes to the LED hardware immediately (previously only `update_leds()` in the main loop did, which doesn't run during `run_conversation`).
+- Templated reply now echoes the actual color name and surfaces errors instead of pretending success.
+
+Gemini tool routing reliability:
+- Switched from `gemini-2.5-flash-lite` to `gemini-2.5-flash` (paid tier — much better tool routing).
+- Added `toolConfig: {functionCallingConfig: {mode: AUTO}}`.
+- Lowered temperature 0.95 → 0.7 for more deterministic routing.
+- Rewrote system prompt: tool routing is MANDATORY, with explicit "User: X → CALL tool" examples for every tool.
+- On-screen `route: tool / route: text` indicator + `tool: <name>` label + tool result text for ~6 seconds — invaluable diagnostic.
+
+Beemo name:
+- TTS substitutes `BMO`/`Bmo`/`bmo`/`B-M-O` → `Beemo` before synthesis.
+- System prompt explicitly tells Gemini to always write the name as "Beemo".
+
+Phase 9k — camera + Gemini Vision:
+- GC0308 camera (CoreS3 built-in) lazy-initialized on first `see_scene` call.
+- VGA (640x480) capture in RGB565, converted to JPEG with `frame2jpg()`.
+- Pre-snap body language: wide eyes + white LEDs + "looking..." label + slight head down.
+- Two-tick shutter click sound (3kHz + 2.2kHz).
+- Captured frame previewed on BMO's screen for ~2 sec (downscaled VGA → 320×240).
+- JPEG sent to Gemini Vision (`gemini-2.5-flash` endpoint) with a BMO-personality system instruction.
+- Vision response spoken directly (already styled by the prompt).
+- Last 5 photos kept in a PSRAM ring buffer. Each photo carries its description as a caption + a Unix timestamp.
+- Web routes: `/photos` (HTML gallery, newest first) and `/photo?i=N` (raw JPEG).
+- Link added to the status page.
+
+Bug fixes:
+- Weather tool: switched from HTTPS (TLS handshake failed, returned -1) to plain HTTP + curl User-Agent + redirect-follow. Works now.
+- Dance: real C-E-G-C arpeggio synced with swinging pan motion (was just shaking).
+- **Empty Gemini response fix:** `gemini-2.5-flash` sometimes returns content with no parts when the user message has an empty text part + audio. Replaced the empty `"text":""` with explicit instructions ("Listen to the attached audio... call a tool if applicable, otherwise reply with a playful sentence."). This unblocked all tool routing.
+
+### Architecture notes — banked for next session
+
+- Camera init releases the I2C bus (`M5.In_I2C.release()`) — IMU/touch are on the same bus. After camera init, IMU+touch may stop responding until re-init. Lazy init means this only happens when `see_scene` fires.
+- Photo ring buffer: 5 slots × ~30-60KB each ≈ 300KB PSRAM. Lost on reboot. Future iteration: persist to LittleFS or SD.
+- `update_leds()` only runs from the main loop, NOT during `run_conversation`. Any LED change during a conversation must call `set_led_override` (which now pushes to hardware immediately) OR call `update_leds()` directly.
+- Gemini request format that works: `{"role":"user","parts":[{"text":"Listen and respond..."},{"inlineData":{...audio...}}]}`. **Do not use empty text part** on `gemini-2.5-flash`.
+- `gemini-2.5-flash` rate limit on paid tier is plenty for normal use. Cost is ~$0.10/M input + $0.40/M output. A conversation turn is ~2k tokens.
+
+### Security TODO — rotate exposed keys (still pending)
+Both `BMO_GEMINI_API_KEY` and `BMO_TTS_API_KEY` from `firmware/IdleLab/gemini_credentials.h` got pulled into a prior conversation's context window. They're still **in the local file (gitignored)**, so they never hit git, but they were visible to me. Rotate at https://aistudio.google.com/apikey and update the local file. ~3 min.
+
+---
 
 ### Original Phase 9 status — Phase 9a (local hardware features) + Phase 9b (Wi-Fi provisioning).
 
