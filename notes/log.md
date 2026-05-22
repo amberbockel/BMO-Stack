@@ -6,27 +6,74 @@ Newest entries on top. After every working session, append a new block: what we 
 
 ## NEXT SESSION — RESUME HERE
 
-> Pinned section. Read this first when you come back. Last updated 2026-05-20 overnight, after a big push: Phases 9g (tool calling fixed), 9h (UX polish), 9k (camera + Gemini Vision) all landed.
+> Pinned section. Read this first when you come back. Last updated 2026-05-21 evening, after a session that shipped: new dry/sarcastic personality, responsiveness improvements (VAD + reactivity + ack tones + tighter idle), always-listening mode, on-device wake word ("Hi, ESP" via WakeNet), double-tap toggle. **Commit: `caebbed`.**
 
-### Where we are (current state, working build)
+### Where we are (working build)
 
-Robot is in a great place. Commit `ab6dbdd` on `main`. End-to-end working:
-- **Hold-to-talk** (press and hold touch strip ~½s) → starts conversation. Tap = pet (heart eyes). Swipe = also starts convo (fallback).
-- **Double-tap during conversation** → aborts speech/listening immediately.
-- **Tool routing on `gemini-2.5-flash`** (paid tier): `set_led_color`, `play_gesture(dance)`, `get_time`, `get_weather`, `get_battery_level`, `see_scene` (camera + Vision).
-- **LED color** actually changes the LEDs and persists across conversation turns (sticky override).
-- **"Beemo" pronunciation** via TTS substitution + system prompt instruction.
-- **Photos**: ask "Beemo, what do you see?" → BMO does pre-snap body language (wide eyes, white LEDs, "looking..."), camera shutter click sound, captures VGA frame, shows preview on screen, sends to Gemini Vision, speaks description. Last 5 photos browseable at `http://bmo.local/photos`.
+End-to-end working:
+- **On-device wake word**: say **"Hi, ESP"** clearly → conversation triggers. No cloud call for activation. Built on Espressif WakeNet9 model in the `model` partition.
+- **Hold-to-talk** still works as explicit override.
+- **Double-tap on touch sensor** → toggles always-listening on/off (ascending two-tone on, descending two-tone off, on-screen "listening: ON/OFF" label).
+- **Single tap** → pet/heart eyes (deferred 500ms to disambiguate from double-tap).
+- **Double-tap during conversation** → aborts speech/listening.
+- **Tools all working** (gemini-2.5-flash, paid tier): `set_led_color`, `play_gesture(dance)`, `get_time`, `get_weather`, `get_battery_level`, `see_scene`.
+- **New Beemo personality**: dry, lightly sarcastic, weirdly observant, Amber-aware. No more "Yay!/Beep boop!" filler.
+- **Live reactivity** while you talk: amplitude-driven mouth/eye, head bob at ~3Hz, ack tone (mhm/oh/chirp) before Gemini call.
+- **Photos**: "Beemo, what do you see?" → camera snap with shutter click + on-screen preview + Vision description. Gallery at `bmo.local/photos`.
+- **Beemo pronunciation** via TTS substitution + prompt.
+- **Wake refractory window** (1.5s after wake, 2.5s after conversation end) prevents BMO's own voice from re-triggering.
 
-### Morning tasks (you, ~5-15 min)
+### Open work — custom "Hey Beemo" wake word
 
-Order: do these in sequence.
+We pivoted away from Colab self-training because the microWakeWord notebook has cascading repo-drift errors (piper-sample-generator restructured, dependencies broken). Plan now: **community batch request**.
 
-1. **Read [`notes/wake-word-submission.md`](wake-word-submission.md)** — honest correction of what I told you last session. Espressif's free service isn't really a hobbyist path. Real options: free microWakeWord (community request OR self-train in Colab), or $1k CustomESP-SR. Pick a path. (~5 min to read + pick.)
-2. **If you picked microWakeWord Path A (community request):** post on the HA forum thread linked in the guide. ~5 min including account creation.
-3. **If you picked microWakeWord Path B (Colab self-train):** open the Colab notebook, change wake word to "hey beemo", run all cells. ~15 min to start; training runs unattended for ~3 hours.
-4. **Rotate exposed API keys** (still pending from previous session). https://aistudio.google.com/apikey, update `firmware/IdleLab/gemini_credentials.h`. ~3 min.
-5. **Tell me which path you picked** so I can plan the firmware integration accordingly. The TFLite Micro integration (Path A/B) is different from WakeNet9 (Path C).
+**Morning task for you (~5 min):**
+
+1. Create a Home Assistant community account if you don't have one: https://community.home-assistant.io
+2. Post on the thread https://community.home-assistant.io/t/microwakeword-custom-v2-wake-words-taking-requests-12-2-only/803409 with text like:
+   ```
+   Requesting a custom wake word: "Hey Beemo"
+   Target: ESP32-S3 with TensorFlow Lite Micro
+   Phonetic guidance: "hey BEE-mo" (two syllables on Beemo)
+   Use case: M5Stack CoreS3 personal companion robot (BMO from Adventure Time)
+   Thanks!
+   ```
+3. Wait for the maintainer to batch-train (days to ~2 weeks). They'll post the `.tflite` back in the thread.
+4. When the file arrives: drop it into `firmware/IdleLab/wakenet_model/` (folder doesn't exist yet — create it) and tell me "Hey Beemo model arrived".
+
+**Then me (~30 min when model arrives):**
+- Add TensorFlow Lite Micro library wiring (`espressif__esp-tflite-micro` is bundled with the M5Stack platform — no extra install).
+- Replace the WakeNet9 ('Hi, ESP') detection path with TFLM inference on the new model.
+- Compile, flash, test.
+- The on-device flow stays identical; only the model swaps.
+
+### Other pending TODOs
+
+1. **Rotate API keys** (still pending from a prior session). Both `BMO_GEMINI_API_KEY` and `BMO_TTS_API_KEY` from `firmware/IdleLab/gemini_credentials.h` got exposed in earlier conversation contexts. Rotate at https://aistudio.google.com/apikey, update the local file (gitignored). ~3 min.
+
+### Build/deploy commands for this firmware (banked)
+
+Custom partition required for the wake word model. Always use these flags:
+
+```
+arduino-cli compile \
+  --fqbn m5stack:esp32:m5stack_cores3 \
+  --build-property "build.partitions=esp_sr_16" \
+  --build-property "upload.maximum_size=3145728" .
+
+arduino-cli upload \
+  --fqbn m5stack:esp32:m5stack_cores3 \
+  --port /dev/cu.usbmodem1101 .
+```
+
+Wake-word model flash (one-time, or when swapping models):
+
+```
+/Users/agentneon/Library/Arduino15/packages/m5stack/tools/esptool_py/5.1.0/esptool \
+  --port /dev/cu.usbmodem1101 --chip esp32s3 --baud 921600 \
+  write-flash 0xD10000 \
+  /Users/agentneon/Library/Arduino15/packages/m5stack/tools/esp32s3-libs/3.3.7/esp_sr/srmodels.bin
+```
 
 ### Next session priorities
 
