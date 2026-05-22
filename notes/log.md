@@ -6,7 +6,30 @@ Newest entries on top. After every working session, append a new block: what we 
 
 ## NEXT SESSION — RESUME HERE
 
-> Pinned section. Read this first when you come back. Last updated 2026-05-21 evening, after a session that shipped: new dry/sarcastic personality, responsiveness improvements (VAD + reactivity + ack tones + tighter idle), always-listening mode, on-device wake word ("Hi, ESP" via WakeNet), double-tap toggle. **Commit: `caebbed`.**
+> Pinned section. Read this first when you come back. **Last updated 2026-05-21 overnight after an autonomous attempt to integrate the 'Hey Beepoh' wake word.** Live firmware still has the working WakeNet9 'Hi, ESP' wake word; the overnight attempt stalled at Phase A with reference files vendored but not yet wired into the build. Latest commit: `a6871f3`.
+
+### Overnight autonomous attempt — what happened (good faith honest summary)
+
+I revised my own scope estimate down from "1-2 days" to "3-5 hours focused" once I dug into existing implementations. With your approval I went autonomous to attempt it overnight.
+
+**Plan (5 phases):**
+A. Port TF `audio_microfrontend` lib + kissfft into the sketch tree
+B. Init frontend at boot
+C. TFLM streaming-model setup (resource variables, expanded ops)
+D. Wire mic frames -> features -> interpreter -> sliding-window detection
+E. Compile + upload + test, or rollback
+
+**Where I actually got:**
+- **Phase A: ~half done.** All 35 source files (microfrontend + kissfft) vendored into `firmware/IdleLab/microfrontend/`. Build is unchanged because nothing `#include`s them yet -- they're inactive reference files. README.md in that folder documents exactly what's left.
+- **Phases B-E: not started.**
+
+**Why I stopped:**
+- Phase A budget was 30 min. Burned ~90 min on it discovering deeper unknowns: kissfft files weren't where I expected (had to find them on mborgerding's repo), the bundled tflite-micro library references kissfft symbols but doesn't define them (we have to bring in the implementations ourselves), and the Arduino subfolder build behavior + namespace handling are still unverified.
+- Per the safety-rails I set, I'd rather commit clean reference files than push buggy half-integration at 2 AM that you have to untangle.
+
+**Honest scope re-revision:** the 3-5 hour estimate was still too optimistic. Realistic: **6-12 hours of focused work** spread over 1-2 fresh sessions, because each step has potential surprises (build system, namespace resolution, audio frontend matching training-time features, streaming-model resource variables, threshold tuning). I keep underestimating this.
+
+**Recommendation:** the **community batch request on the HA forum** is still the cleanest path to a proper "Hey Beemo" wake word with a low false-trigger rate. The reference files I vendored will accelerate the eventual integration whenever someone -- me in a future session or you with a separate ESPHome build -- tackles it.
 
 ### Where we are (working build)
 
