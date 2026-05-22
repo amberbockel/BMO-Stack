@@ -1,0 +1,15 @@
+{
+  "type": "micro",
+  "wake_word": "Hey Beepoh",
+  "author": "microwakeword.com",
+  "website": "https://microwakeword.com",
+  "model": "hey_beepoh.tflite",
+  "trained_languages": [
+    "en"
+  ],
+  "version": 1,
+  "micro": {
+    "probability_cutoff": 0.97,
+    "sliding_window_average_size": 5
+  }
+}
