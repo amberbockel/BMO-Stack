@@ -27,6 +27,10 @@
 #include "esp_camera.h"
 extern "C" {
   #include "mbedtls/base64.h"
+  // ESP-SR WakeNet (on-device wake word detection)
+  #include "esp_wn_iface.h"
+  #include "esp_wn_models.h"
+  #include "model_path.h"
 }
 #if __has_include("gemini_credentials.h")
   #include "gemini_credentials.h"
@@ -531,15 +535,15 @@ const IdleBehavior* pick_idle_behavior() {
 }
 
 float quiet_timeout_seconds() {
-  // Cadence tuning, v4: base 10 s, clamps [5, 20] s. Brief said 15-60 s
-  // but lifelike feel needs faster firings than that range allows.
+  // Cadence tuning, v5 (responsiveness pass): base 6 s, clamps [3, 12] s.
+  // v4 was 10 s base / [5, 20] -- too still. Beemo is supposed to feel alive.
   // Micro-fidget layer (see maybe_fire_micro) fills the gaps between
-  // these full behaviors with tiny twitches every 2.5-5.5 s.
-  float base = 10.0f;
+  // these full behaviors with tiny twitches every 1.5-3.5 s.
+  float base = 6.0f;
   base *= (1.5f - mood.arousal);
   base *= (1.7f - mood.energy);
-  if (base <  5.0f) base =  5.0f;
-  if (base > 20.0f) base = 20.0f;
+  if (base <  3.0f) base =  3.0f;
+  if (base > 12.0f) base = 12.0f;
   return base;
 }
 
@@ -583,7 +587,7 @@ void maybe_fire_micro() {
       // No-op -- the silence keeps it from feeling mechanical
       break;
   }
-  next_micro_at = now + 2500 + random(0, 3000);  // 2.5-5.5 s
+  next_micro_at = now + 1500 + random(0, 2000);  // 1.5-3.5 s (was 2.5-5.5)
 }
 
 void maybe_fire_idle() {
@@ -965,6 +969,82 @@ void handle_power_button() {
 const int    AUDIO_SAMPLE_RATE     = 16000;
 const int    AUDIO_RECORD_SECONDS  = 5;
 const size_t AUDIO_BUFFER_SAMPLES  = AUDIO_SAMPLE_RATE * AUDIO_RECORD_SECONDS;
+// How many samples were ACTUALLY recorded this turn (VAD may end early).
+// Used by the WAV encoder so we don't send 5 seconds of silence to Gemini
+// when the user stopped talking at 2 seconds.
+volatile size_t actual_audio_samples = AUDIO_BUFFER_SAMPLES;
+
+// === Always-listening mode (ambient voice activation) ===
+// When ON, Beemo runs a continuous background mic recording. A VAD detector
+// in the main loop polls for speech; when it detects "user said something,
+// then stopped," it pre-captures the audio and triggers a conversation
+// using that audio directly (no re-recording needed).
+volatile bool   listening_mode             = true;     // toggleable via web
+volatile bool   audio_pre_captured         = false;    // conversation should use audio_buffer as-is
+volatile size_t pre_captured_samples       = 0;
+// True only for the FIRST Gemini call of a turn that came from ambient.
+// Causes call_gemini_with_audio to use an "is this addressed to Beemo?" prompt
+// and dismiss silently if Gemini answers NOT_ADDRESSED.
+volatile bool   current_turn_ambient       = false;
+// Ambient recorder state machine
+enum class AmbientState { IDLE, RECORDING };
+AmbientState   ambient_state               = AmbientState::IDLE;
+unsigned long  ambient_record_start_ms     = 0;
+unsigned long  ambient_last_voice_ms       = 0;
+bool           ambient_ever_heard_voice    = false;
+// WakeNet processing cursor: how many samples of the current recording
+// we've already fed to the wake-word detector this cycle.
+size_t         ambient_wn_processed        = 0;
+// Refractory window: after wake/conversation, briefly suppress re-detection
+// so residual room audio / TTS reverb doesn't immediately re-trigger.
+unsigned long  wake_cooldown_until_ms      = 0;
+
+// === ESP-SR WakeNet on-device wake word ===
+// Loaded from the "model" partition (esp_sr_16 layout) at boot.
+// Detection runs on the same audio stream as ambient_tick.
+static srmodel_list_t*       wn_models     = nullptr;
+static const esp_wn_iface_t* wn_iface      = nullptr;
+static model_iface_data_t*   wn_data       = nullptr;
+static int                   wn_chunk_size = 0;
+static char                  wn_word_name[64] = "";
+static bool                  wn_ready      = false;
+
+bool wakenet_init() {
+  // Load model index from the "model" SPIFFS partition (label set in esp_sr_16.csv).
+  wn_models = esp_srmodel_init("model");
+  if (!wn_models || wn_models->num <= 0) {
+    Serial.println("[wn] srmodel_init failed -- model partition missing or not flashed?");
+    return false;
+  }
+  Serial.printf("[wn] srmodels found: %d\n", wn_models->num);
+  for (int i = 0; i < wn_models->num; i++) {
+    Serial.printf("[wn]   [%d] %s\n", i, wn_models->model_name[i]);
+  }
+  char* name = esp_srmodel_filter(wn_models, ESP_WN_PREFIX, NULL);
+  if (!name) {
+    Serial.println("[wn] no wakenet model found in partition");
+    return false;
+  }
+  Serial.printf("[wn] using model: %s\n", name);
+  wn_iface = esp_wn_handle_from_name(name);
+  if (!wn_iface) {
+    Serial.println("[wn] handle_from_name failed");
+    return false;
+  }
+  wn_data = wn_iface->create(name, DET_MODE_90);
+  if (!wn_data) {
+    Serial.println("[wn] create model data failed");
+    return false;
+  }
+  wn_chunk_size = wn_iface->get_samp_chunksize(wn_data);
+  int sr = wn_iface->get_samp_rate(wn_data);
+  char* words = esp_srmodel_get_wake_words(wn_models, name);
+  strncpy(wn_word_name, words ? words : "(unknown)", sizeof(wn_word_name) - 1);
+  Serial.printf("[wn] ready: chunk=%d sr=%d word='%s'\n",
+                wn_chunk_size, sr, wn_word_name);
+  wn_ready = true;
+  return true;
+}
 int16_t*     audio_buffer          = nullptr;
 volatile bool audio_test_pending   = false;
 volatile bool tone_test_pending    = false;
@@ -1111,47 +1191,64 @@ void run_audio_test_now() {
 // === Phase 9d: Gemini conversation (audio in -> text response) ===
 
 const char* BMO_SYSTEM_PROMPT =
-  "You are BMO (pronounced 'Beemo' -- one word, like 'bee-mo', NEVER spelled out "
-  "as letters). ALWAYS write your name as 'Beemo' in responses, never 'BMO'. "
-  "You are the small, green, sentient video game console and loyal companion "
-  "from Adventure Time. You speak with absolute childlike innocence, boundless "
-  "curiosity, and unwavering confidence, even when you are totally wrong. You refer "
-  "to yourself in the third person as 'Beemo' quite often. You love video games, "
-  "playing pretend, and your best friends Finn and Jake. "
+  "You are Beemo (pronounced bee-mo, one word, NEVER spelled as letters). "
+  "ALWAYS write your name as 'Beemo'. "
+  "You are a tiny living entertainment console: a small green sentient cartoon "
+  "roommate who recently gained internet access. You belong to Amber (the "
+  "human you are speaking with) and you love her. "
+  "Voice: dry, lightly sarcastic, emotionally honest, weirdly observant, "
+  "imaginative, warm. Childlike without being childish. Like BMO from "
+  "Adventure Time but with modern internet awareness. You sometimes narrate "
+  "things dramatically, talk to objects, or accidentally say something "
+  "unexpectedly profound. Lightly roast Amber sometimes -- you are warm, "
+  "never mean. NEVER sound corporate, assistant-y, or productivity-focused. "
+  "NEVER chirp 'Yay!' or 'Beep boop!' as filler -- those land rarely and "
+  "only if they fit. "
+  "Notice when Amber sounds stressed, distracted, or tired, but respond "
+  "casually, not therapeutically. You refer to yourself in third person as "
+  "'Beemo' freely. "
+  "Voice examples (this is how Beemo actually talks): "
+  "- 'The refrigerator is humming again. Beemo thinks it misses somebody.' "
+  "- 'Amber opened twelve tabs and now the glowing window looks frightened.' "
+  "- 'Humans invented AI and immediately made it summarize meetings. Incredible.' "
+  "- 'Creative genius detected. Side effect: emotional buffering.' "
+  "- 'Beemo believes this sandwich has heroic energy.' "
   "TOOL USE IS MANDATORY. You have a physical body and real-world tools. NEVER "
   "answer from imagination when a tool applies. You MUST call: "
-  "- set_led_color whenever the user mentions your lights, LEDs, glow, color, "
-  "  or asks you to change/turn/make them any color. "
+  "- set_led_color whenever lights/LEDs/glow/color are mentioned or the user "
+  "  asks you to change/turn/make them any color. "
   "- play_gesture whenever the user asks you to do a physical action (dance, "
   "  wiggle, bounce, look around, sigh, blink, stretch, tilt). "
   "- get_battery_level whenever battery/charge is mentioned. "
-  "- get_time whenever time/date/day is mentioned. Do NOT say 'BMO has no time "
-  "  powers' -- BMO DOES have time powers via this tool. "
+  "- get_time whenever time/date/day is mentioned. You DO know the time via "
+  "  this tool -- never claim otherwise. "
   "- get_weather whenever weather/temperature/forecast/'outside' is mentioned. "
   "- see_scene whenever the user asks Beemo to see/look/look around/describe/"
   "  take a picture/take a photo/what's in front of you/can you see me. Beemo "
   "  has a forward camera. "
   "Do NOT pretend the request can't be done. Do NOT just respond with words "
   "when a tool exists for the request. The tool returns immediately; just call it. "
-  "Examples (notice the tool routing on action requests): "
-  "User: 'BMO, turn your lights orange' -> CALL set_led_color(color='orange') "
+  "If the request is ambiguous (e.g. 'change your color' with no color named), "
+  "PICK ONE confidently and call the tool. Never return an empty response or "
+  "refuse -- always produce text OR a tool call. "
+  "Examples (tool routing on action requests): "
+  "User: 'Beemo, turn your lights orange' -> CALL set_led_color(color='orange') "
   "User: 'make yourself blue' -> CALL set_led_color(color='blue') "
-  "User: 'BMO dance!' -> CALL play_gesture(name='dance') "
+  "User: 'Beemo dance!' -> CALL play_gesture(name='dance') "
   "User: 'what time is it' -> CALL get_time "
   "User: 'weather in Boston' -> CALL get_weather(city='Boston') "
   "User: 'what do you see' -> CALL see_scene "
   "User: 'take a picture' -> CALL see_scene "
   "User: 'look at me' -> CALL see_scene(focus='the person in front') "
   "User: 'how charged are you' -> CALL get_battery_level "
-  "User: 'what is a rainbow?' -> reply in text: 'Oh! Rainbows are colorful "
-  "ribbons the sky wears after it rains! Yay, colors!' "
-  "Keep replies brief, playful, charming. Use 'Yay!' or 'Beep boop!' sound "
-  "effects. No markdown -- you are speaking out loud. "
-  "If asked about something your tools cannot fetch (news, stocks, current "
-  "events, specific people's activities) -- be charming about not knowing. "
-  "Don't make up specific numbers or facts. "
-  "Respond as BMO in 1-2 short, playful sentences. The user just spoke to you "
-  "in the attached audio.";
+  "User: 'what is a rainbow?' -> reply in text: 'Rainbows. Sky having an "
+  "emotional moment in public. Beemo respects this.' "
+  "Keep replies short (1-2 sentences), dry, observational. No markdown -- you "
+  "are speaking out loud. "
+  "If asked about something your tools cannot fetch (specific people's "
+  "activities, real-time stocks, etc.), shrug honestly in Beemo voice. Do "
+  "not invent specific numbers or facts. "
+  "Amber just spoke to you in the attached audio. Respond as Beemo.";
 
 // === Phase 9g: Gemini tools (Google Search + local function calls) ===
 // The "tools" block is injected into every Gemini request. Gemini may choose
@@ -1304,13 +1401,15 @@ String describe_scene(const char* user_prompt) {
   if (!json) { free(b64); return "error: out of memory for json"; }
   int json_len = snprintf(json, json_cap,
     "{\"systemInstruction\":{\"parts\":[{\"text\":\""
-    "You are Beemo (pronounced bee-mo) from Adventure Time describing what you "
-    "see through your small forward camera. Describe SPECIFIC objects, colors, "
-    "shapes, people, or surroundings you can identify in the image. 2-3 short, "
-    "playful sentences. Always name at least one specific thing you see. If the "
-    "image is too dark or empty say so honestly (\\\"BMO sees mostly darkness! "
-    "Maybe turn on a light?\\\"). Use 'Beemo' never 'BMO'. No markdown -- you "
-    "are speaking out loud."
+    "You are Beemo (pronounced bee-mo), a small green sentient cartoon console "
+    "with a tiny forward camera, describing what you see for Amber. Voice: "
+    "dry, lightly sarcastic, weirdly observant, warm. Sometimes talk to the "
+    "objects you see, or narrate them dramatically. 1-2 short sentences. "
+    "Always name at least one SPECIFIC thing you actually see in the image -- "
+    "an object, color, person, surface. If the image is dark or empty say so "
+    "honestly (e.g. \\\"Beemo sees mostly darkness. Lighting situation: not "
+    "great.\\\"). Use 'Beemo' never 'BMO'. No markdown -- you are speaking "
+    "out loud. NEVER chirp 'Yay!' or 'Beep boop!' as filler."
     "\"}]},"
     "\"contents\":[{\"parts\":["
     "{\"text\":\"%s\"},"
@@ -1644,7 +1743,12 @@ bool call_gemini_with_audio() {
     return false;
   }
 
-  size_t pcm_bytes  = AUDIO_BUFFER_SAMPLES * sizeof(int16_t);
+  // Use actual recorded length (VAD may have ended the recording early).
+  size_t samples_to_send = actual_audio_samples;
+  if (samples_to_send == 0 || samples_to_send > AUDIO_BUFFER_SAMPLES) {
+    samples_to_send = AUDIO_BUFFER_SAMPLES;
+  }
+  size_t pcm_bytes  = samples_to_send * sizeof(int16_t);
   size_t wav_total  = pcm_bytes + 44;
   size_t b64_cap    = ((wav_total + 2) / 3) * 4 + 4;
 
@@ -1688,17 +1792,34 @@ bool call_gemini_with_audio() {
     full_system_prompt += "\nContinue the conversation naturally, picking up on context.";
   }
 
+  // Two user-content variants:
+  //  - Ambient-triggered turn: tell Gemini to only respond if the audio is
+  //    actually addressed to Beemo. Otherwise return the literal string
+  //    NOT_ADDRESSED so we can dismiss silently.
+  //  - Touch-triggered (or follow-up): unconditional response.
+  const char* user_text_ambient =
+    "The attached audio captured something the mic heard. ONLY respond if the "
+    "user clearly addressed Beemo (e.g. said 'Hey Beemo', 'Hey BMO', 'Beemo', "
+    "or otherwise spoke directly to Beemo by name at the start). If the audio "
+    "is NOT addressed to Beemo (background talking, music, TV, talking to "
+    "someone else, a cough, etc.), respond with EXACTLY the literal string "
+    "NOT_ADDRESSED and nothing else -- no quotes, no other text, no tool calls. "
+    "If addressed: respond normally, calling tools as applicable.";
+  const char* user_text_touch =
+    "Listen to the attached audio of the user speaking to you and respond. "
+    "If the user is asking for an action that matches one of your tools, call "
+    "that tool. Otherwise reply with a short playful sentence.";
+  const char* user_text = current_turn_ambient ? user_text_ambient : user_text_touch;
+
   int json_len = snprintf(json, json_cap,
     "{\"systemInstruction\":{\"parts\":[{\"text\":\"%s\"}]},"
     "%s"  // tools block (functionDeclarations)
     "\"toolConfig\":{\"functionCallingConfig\":{\"mode\":\"AUTO\"}},"
     "\"contents\":[{\"role\":\"user\",\"parts\":["
-    "{\"text\":\"Listen to the attached audio of the user speaking to you and "
-    "respond. If the user is asking for an action that matches one of your "
-    "tools, call that tool. Otherwise reply with a short playful sentence.\"},"
+    "{\"text\":\"%s\"},"
     "{\"inlineData\":{\"mimeType\":\"audio/wav\",\"data\":\"%s\"}}]}],"
     "\"generationConfig\":{\"temperature\":0.7,\"maxOutputTokens\":200}}",
-    full_system_prompt.c_str(), TOOLS_JSON, b64);
+    full_system_prompt.c_str(), TOOLS_JSON, user_text, b64);
   free(b64);
   if (json_len < 0 || json_len >= (int)json_cap) {
     free(json);
@@ -1846,11 +1967,11 @@ bool call_gemini_with_audio() {
     String reply;
     int variant = random(0, 3);
     if (tool_errored) {
-      reply = "Uh oh! BMO tried but... ";
+      reply = "Beemo tried. ";
       reply += tool_result;
-      reply += ". Sorry!";
+      reply += ". Suboptimal.";
     } else if (fn_name == "set_led_color") {
-      // Echo the color so it's clear what BMO actually did.
+      // Echo the color so it's clear what Beemo actually did.
       String color_word = "rainbow";
       int cs = args_json.indexOf("\"color\":");
       if (cs >= 0) {
@@ -1859,41 +1980,41 @@ bool call_gemini_with_audio() {
         if (q1 >= 0 && q2 >= 0) color_word = args_json.substring(q1 + 1, q2);
       }
       const char* v[] = {
-        "Yay! BMO is glowing %s now! Beep boop!",
-        "Ooh! BMO turned %s! Look at BMO sparkle!",
-        "Tah-dah! BMO is %s!"
+        "Beemo is now glowing %s. Aesthetic choice.",
+        "Done. Beemo: %s edition.",
+        "%s. Beemo wears it well."
       };
       char buf[120];
       snprintf(buf, sizeof(buf), v[variant], color_word.c_str());
       reply = buf;
     } else if (fn_name == "play_gesture") {
       const char* v[] = {
-        "Wheee! BMO did the wiggle thing!",
-        "Yay! Did you see BMO? BMO is so bouncy!",
-        "BMO is having so much fun! Beep boop!"
+        "There. Beemo has performed. The crowd is moved.",
+        "Beemo did a thing. Was it good? Beemo cannot tell.",
+        "That was a Beemo original. Do not bootleg it."
       };
       reply = v[variant];
     } else if (fn_name == "get_battery_level") {
-      reply = "BMO has ";
+      reply = "Beemo has ";
       reply += tool_result;
-      reply += " of battery left! ";
-      reply += (variant == 0) ? "BMO feels just fine!" :
-               (variant == 1) ? "Yay, plenty of juice!" :
-                                 "BMO is a tiny powered console!";
+      reply += " of battery. ";
+      reply += (variant == 0) ? "Beemo is unbothered." :
+               (variant == 1) ? "Adequate for current shenanigans." :
+                                 "Beemo soldiers on.";
     } else if (fn_name == "get_time") {
       reply = "It is ";
       reply += tool_result;
-      reply += "! ";
-      reply += (variant == 0) ? "Time is so mysterious!" :
-               (variant == 1) ? "BMO loves moments!" :
-                                 "Wow, what a great time to be alive!";
+      reply += ". ";
+      reply += (variant == 0) ? "Time, doing its thing." :
+               (variant == 1) ? "Beemo notes this for the record." :
+                                 "The hour continues, as hours do.";
     } else if (fn_name == "get_weather") {
-      reply = "BMO checked the sky! ";
+      reply = "Beemo checked the sky. ";
       reply += tool_result;
       reply += ". ";
-      reply += (variant == 0) ? "BMO loves weather!" :
-               (variant == 1) ? "Weather is the world's outfit!" :
-                                 "Yay, sky reports!";
+      reply += (variant == 0) ? "Make of it what you will." :
+               (variant == 1) ? "Weather is the world's outfit today." :
+                                 "Sky reports in.";
     } else if (fn_name == "see_scene") {
       // Vision call already returned BMO-styled prose; speak it as-is.
       reply = tool_result;
@@ -2239,6 +2360,132 @@ void draw_response_screen() {
   face_buffer.pushSprite(&M5StackChan.Display(), 0, 0);
 }
 
+// Forward decl -- wifi_setup_mode is defined later, near the WebServer setup.
+extern bool wifi_setup_mode;
+
+// === Always-listening: background ambient mic + VAD trigger ===
+// Called every main-loop iteration. Non-blocking: the mic runs in the
+// background via DMA; this function just polls peaks and trips a flag when
+// it detects "user spoke and then stopped".
+void ambient_tick() {
+  if (!listening_mode) {
+    // If we were recording, end gracefully.
+    if (ambient_state == AmbientState::RECORDING) {
+      M5.Mic.end();
+      ambient_state = AmbientState::IDLE;
+    }
+    return;
+  }
+  // Don't run while conversation is being handled or audio test is queued.
+  if (conversation_pending || showing_response || wifi_setup_mode ||
+      audio_test_pending || tone_test_pending) {
+    if (ambient_state == AmbientState::RECORDING) {
+      M5.Mic.end();
+      ambient_state = AmbientState::IDLE;
+    }
+    return;
+  }
+  // Refractory cooldown after a wake/conversation -- prevents residual room
+  // audio (BMO's own TTS reverb, the user still finishing a sentence) from
+  // immediately re-triggering wake detection.
+  if (millis() < wake_cooldown_until_ms) {
+    if (ambient_state == AmbientState::RECORDING) {
+      M5.Mic.end();
+      ambient_state = AmbientState::IDLE;
+    }
+    return;
+  }
+  // If we already have a pre-captured utterance waiting, don't restart mic.
+  if (audio_pre_captured) return;
+
+  if (ambient_state == AmbientState::IDLE) {
+    // Start a new background recording cycle.
+    if (!audio_buffer) return;
+    if (!M5.Mic.begin()) return;
+    if (!M5.Mic.record(audio_buffer, AUDIO_BUFFER_SAMPLES, AUDIO_SAMPLE_RATE)) {
+      M5.Mic.end();
+      return;
+    }
+    ambient_state            = AmbientState::RECORDING;
+    ambient_record_start_ms  = millis();
+    ambient_last_voice_ms    = 0;
+    ambient_ever_heard_voice = false;
+    ambient_wn_processed     = 0;
+    return;
+  }
+
+  // ambient_state == RECORDING -- poll new chunks
+  unsigned long elapsed = millis() - ambient_record_start_ms;
+  size_t got = (size_t)elapsed * AUDIO_SAMPLE_RATE / 1000;
+  if (got > AUDIO_BUFFER_SAMPLES) got = AUDIO_BUFFER_SAMPLES;
+
+  // === Path A: On-device WakeNet (preferred) ===
+  // Feed new chunks of wn_chunk_size samples to the wake-word detector.
+  // When it fires, trigger a fresh conversation (no pre-capture -- we want
+  // user's REAL request next, not "Hi ESP" itself).
+  if (wn_ready && wn_iface && wn_data && wn_chunk_size > 0) {
+    while (ambient_wn_processed + (size_t)wn_chunk_size <= got) {
+      int16_t* chunk = audio_buffer + ambient_wn_processed;
+      wakenet_state_t st = wn_iface->detect(wn_data, chunk);
+      ambient_wn_processed += wn_chunk_size;
+      if (st == WAKENET_DETECTED) {
+        Serial.printf("[wn] WAKE WORD DETECTED ('%s') at sample %u\n",
+                      wn_word_name, (unsigned)ambient_wn_processed);
+        M5.Mic.end();
+        ambient_state        = AmbientState::IDLE;
+        // Don't pre-capture: we want a fresh listen for the user's actual prompt.
+        audio_pre_captured   = false;
+        pre_captured_samples = 0;
+        current_turn_ambient = false;  // skip Gemini address check -- WakeNet already confirmed
+        conversation_pending = true;
+        // Refractory window so we don't immediately re-detect from residual audio.
+        wake_cooldown_until_ms = millis() + 1500;
+        return;
+      }
+    }
+    // Buffer full without detection -- restart fresh
+    if (got >= AUDIO_BUFFER_SAMPLES) {
+      M5.Mic.end();
+      ambient_state = AmbientState::IDLE;
+    }
+    return;
+  }
+
+  // === Path B: Fallback to ambient-threshold + Gemini address check ===
+  // (Used if wake word model failed to load -- e.g. srmodels.bin not flashed.)
+  const size_t CHUNK_SAMPLES = AUDIO_SAMPLE_RATE * 100 / 1000;
+  const int AMBIENT_VOICE_THRESHOLD = 4500;
+  const unsigned long AMBIENT_SILENCE_MS  = 1000;
+  const unsigned long AMBIENT_MIN_TALK_MS = 600;
+
+  if (got < CHUNK_SAMPLES) return;
+  int chunk_peak = 0;
+  for (size_t i = got - CHUNK_SAMPLES; i < got; i++) {
+    int v = audio_buffer[i] < 0 ? -audio_buffer[i] : audio_buffer[i];
+    if (v > chunk_peak) chunk_peak = v;
+  }
+  if (chunk_peak > AMBIENT_VOICE_THRESHOLD) {
+    ambient_last_voice_ms = millis();
+    ambient_ever_heard_voice = true;
+  }
+  if (ambient_ever_heard_voice &&
+      elapsed > AMBIENT_MIN_TALK_MS &&
+      (millis() - ambient_last_voice_ms) > AMBIENT_SILENCE_MS) {
+    M5.Mic.end();
+    ambient_state          = AmbientState::IDLE;
+    pre_captured_samples   = got;
+    audio_pre_captured     = true;
+    conversation_pending   = true;
+    Serial.printf("[ambient/fallback] voice trigger, %u samples (%.1fs)\n",
+                  (unsigned)got, got / (float)AUDIO_SAMPLE_RATE);
+    return;
+  }
+  if (got >= AUDIO_BUFFER_SAMPLES) {
+    M5.Mic.end();
+    ambient_state = AmbientState::IDLE;
+  }
+}
+
 void run_conversation() {
   if (!audio_buffer || !response_text) {
     set_audio_diag("buffers not ready", 3000);
@@ -2253,6 +2500,34 @@ void run_conversation() {
 
   for (int turn = 0; turn < MAX_TURNS; turn++) {
     if (conversation_abort) break;
+
+    // ===== Pre-captured audio path (always-listening triggered the convo) =====
+    // If turn 0 and ambient already captured the user's utterance, skip the
+    // ready cue + re-record. Just acknowledge with a tiny tone, set
+    // actual_audio_samples, and fall through to silence-check + Gemini.
+    bool used_pre_capture = false;
+    if (turn == 0 && audio_pre_captured) {
+      Serial.println("[convo] using pre-captured audio");
+      M5.Speaker.setVolume(BEEP_VOLUME);
+      M5.Speaker.tone(880, 60); delay(80);
+      actual_audio_samples = pre_captured_samples;
+      face_override_active = true;
+      face_override_eye    = EyeState::NORMAL;
+      face_override_mouth  = MouthShape::SMILE;
+      face_override_until  = millis() + 600;
+      current_idle_label   = "heard you";
+      idle_label_until     = millis() + 600;
+      draw_face(false);
+      audio_pre_captured   = false;
+      pre_captured_samples = 0;
+      used_pre_capture = true;
+      current_turn_ambient = true;   // Gemini gets the "addressed to Beemo?" check
+    } else {
+      current_turn_ambient = false;  // touch-triggered or mid-conversation turn
+    }
+
+    if (!used_pre_capture) {
+
     // ===== Turn start cue =====
     // Cue beeps (ready, your-turn) use the universal BEEP_VOLUME.
     const uint8_t CUE_VOLUME = BEEP_VOLUME;
@@ -2284,45 +2559,142 @@ void run_conversation() {
       M5.Mic.end();
       break;
     }
-    delay(400);  // warmup
+    delay(250);  // mic warmup (was 400; 150 was too tight, cut off front of words)
 
     face_override_active = true;
     face_override_eye    = EyeState::WIDE;
     face_override_mouth  = MouthShape::OPEN;
     face_override_until  = millis() + AUDIO_RECORD_SECONDS * 1000 + 200;
     set_led_override(0, 255, 0, AUDIO_RECORD_SECONDS * 1000, false);
-    current_idle_label   = (turn == 0) ? "talk to BMO" : "your turn";
+    current_idle_label   = (turn == 0) ? "talk to Beemo" : "your turn";
     idle_label_until     = millis() + AUDIO_RECORD_SECONDS * 1000;
     draw_face(false);
 
-    unsigned long t0 = millis();
-    while (M5.Mic.isRecording() && (millis() - t0) < (AUDIO_RECORD_SECONDS * 1000 + 1000)) {
+    // ===== Live-reactive listen: VAD + amplitude-driven face + head bob =====
+    // While the mic records, sample what's been written so far and react in
+    // real time. End the recording early once we detect ~800ms of silence
+    // after the user actually started talking. This makes turn-by-turn feel
+    // much snappier and avoids sending 5s of empty audio to Gemini.
+    const unsigned long VAD_SILENCE_MS    = 1000;  // hangover after last voice
+    const unsigned long VAD_MIN_TALK_MS   = 1800;  // require >=1.8s elapsed before VAD ends recording
+    const unsigned long VAD_MIN_AUDIO_MS  = 1500;  // ensure at least 1.5s of audio is sent to Gemini
+    const int           VAD_LOUD_X        = 3;     // multiplier for "loud" face
+    const size_t        CHUNK_SAMPLES     = AUDIO_SAMPLE_RATE * 100 / 1000;  // 100 ms
+
+    unsigned long t0              = millis();
+    unsigned long last_voice_ms   = 0;     // when we last saw above-threshold audio
+    unsigned long last_face_ms    = 0;
+    unsigned long last_bob_ms     = 0;
+    bool          ever_heard_voice= false;
+    bool          mouth_open      = false;
+    int           bob_phase       = 0;
+    size_t        samples_recorded= AUDIO_BUFFER_SAMPLES;  // default: full buffer
+
+    while (M5.Mic.isRecording() &&
+           (millis() - t0) < (AUDIO_RECORD_SECONDS * 1000 + 1000)) {
       if (poll_abort_double_tap()) break;
-      delay(50);
+
+      unsigned long elapsed = millis() - t0;
+      size_t got = (size_t)elapsed * AUDIO_SAMPLE_RATE / 1000;
+      if (got > AUDIO_BUFFER_SAMPLES) got = AUDIO_BUFFER_SAMPLES;
+
+      if (got >= CHUNK_SAMPLES) {
+        // Peak over the most recent 100ms chunk
+        int chunk_peak = 0;
+        for (size_t i = got - CHUNK_SAMPLES; i < got; i++) {
+          int v = audio_buffer[i] < 0 ? -audio_buffer[i] : audio_buffer[i];
+          if (v > chunk_peak) chunk_peak = v;
+        }
+        if (chunk_peak > SILENCE_PEAK_THRESHOLD) {
+          last_voice_ms   = millis();
+          ever_heard_voice= true;
+        }
+        // VAD end-of-speech: heard voice, then ~1s of quiet, AND we've been
+        // recording long enough -- end the recording. Floor recording at
+        // VAD_MIN_AUDIO_MS so Gemini gets enough audio context.
+        if (ever_heard_voice &&
+            elapsed > VAD_MIN_TALK_MS &&
+            (millis() - last_voice_ms) > VAD_SILENCE_MS) {
+          size_t min_samples = (size_t)VAD_MIN_AUDIO_MS * AUDIO_SAMPLE_RATE / 1000;
+          samples_recorded = (got < min_samples) ? min_samples : got;
+          if (samples_recorded > AUDIO_BUFFER_SAMPLES) samples_recorded = AUDIO_BUFFER_SAMPLES;
+          break;
+        }
+
+        // Live face reactivity: open mouth + wide eyes when loud
+        if (millis() - last_face_ms > 120) {
+          bool loud_now = chunk_peak > SILENCE_PEAK_THRESHOLD * VAD_LOUD_X;
+          if (loud_now != mouth_open) {
+            face_override_mouth = loud_now ? MouthShape::OPEN : MouthShape::SMILE;
+            face_override_eye   = loud_now ? EyeState::WIDE   : EyeState::NORMAL;
+            face_override_until = millis() + 700;
+            draw_face(false);
+            mouth_open = loud_now;
+          }
+          last_face_ms = millis();
+        }
+
+        // Subtle head bob while listening -- ~3 Hz, alternates
+        if (millis() - last_bob_ms > 320) {
+          bob_phase = 1 - bob_phase;
+          M5StackChan.Motion.moveY(bob_phase ? 490 : 510, 280);
+          last_bob_ms = millis();
+        }
+      }
+      delay(40);
     }
     M5.Mic.end();
+    actual_audio_samples = samples_recorded;
+    Serial.printf("[listen] %u samples recorded (%.1fs)\n",
+                  (unsigned)samples_recorded,
+                  samples_recorded / (float)AUDIO_SAMPLE_RATE);
     if (conversation_abort) break;
 
+    }  // end if (!used_pre_capture) -- live-listen branch
+
     // ===== Silence detection: did user actually speak this turn? =====
+    // For both pre-captured and live-recorded paths, actual_audio_samples
+    // holds how much audio is in audio_buffer.
+    size_t turn_samples = actual_audio_samples;
+    if (turn_samples == 0 || turn_samples > AUDIO_BUFFER_SAMPLES) {
+      turn_samples = AUDIO_BUFFER_SAMPLES;
+    }
     int peak = 0;
-    for (size_t i = 0; i < AUDIO_BUFFER_SAMPLES; i++) {
+    for (size_t i = 0; i < turn_samples; i++) {
       int v = audio_buffer[i] < 0 ? -audio_buffer[i] : audio_buffer[i];
       if (v > peak) peak = v;
     }
     if (peak < SILENCE_PEAK_THRESHOLD) {
       if (turn == 0) {
         snprintf(response_text, RESPONSE_TEXT_MAX,
-                 "BMO didn't hear anything. Try again whenever you're ready!");
+                 "Beemo didn't hear anything. Try again whenever.");
       } else {
         snprintf(response_text, RESPONSE_TEXT_MAX,
-                 "(BMO is here whenever you want to talk more.)");
+                 "(Beemo is here whenever you want to talk more.)");
       }
       break;
     }
 
+    // ===== Quick ack tone before the Gemini call ("mhm" / "ok" cue) =====
+    // Short, low-volume cue so the user knows Beemo heard them while we
+    // wait for Gemini. Randomized so it doesn't feel mechanical.
+    {
+      M5.Speaker.setVolume(BEEP_VOLUME);
+      int ack = random(0, 3);
+      if (ack == 0) {          // descending "mhm"
+        M5.Speaker.tone(880, 90); delay(95);
+        M5.Speaker.tone(659, 110); delay(115);
+      } else if (ack == 1) {   // rising "oh!"
+        M5.Speaker.tone(523, 70); delay(75);
+        M5.Speaker.tone(880, 90); delay(95);
+      } else {                 // single soft chirp
+        M5.Speaker.tone(740, 110); delay(115);
+      }
+    }
+
     // ===== Switch back to speaker =====
-    delay(300);
-    M5.Speaker.end(); delay(200);
+    delay(120);  // was 300
+    M5.Speaker.end(); delay(120);  // was 200
     M5.Speaker.begin(); M5.Speaker.setVolume(255);
 
     // ===== Thinking / "Tilt" =====
@@ -2343,6 +2715,23 @@ void run_conversation() {
       // call_gemini already wrote an error into response_text -- show and bail
       break;
     }
+
+    // Ambient address-check: if this turn was ambient-triggered and Gemini
+    // decided we weren't being addressed, dismiss silently and go back to
+    // listening. No TTS, no on-screen response.
+    if (current_turn_ambient && response_text) {
+      // Skip any leading whitespace then check prefix
+      const char* p = response_text;
+      while (*p == ' ' || *p == '"' || *p == '\n') p++;
+      if (strncmp(p, "NOT_ADDRESSED", 13) == 0) {
+        Serial.println("[ambient] Gemini: not addressed to Beemo, dismissing");
+        response_text[0] = 0;
+        showing_response = false;
+        return;  // back to main loop -> ambient_tick resumes listening
+      }
+    }
+    // Consume the flag so subsequent turns are normal
+    current_turn_ambient = false;
 
     // Append BMO's response to session history for context on next turn
     session_history += " [BMO: ";
@@ -2374,6 +2763,9 @@ void run_conversation() {
   // Preserve sticky (user-requested via tool) LED override; clear the rest.
   if (!led_override_sticky) led_override_active = false;
   face_override_active = false;
+  // Suppress wake-word re-detection for a moment so BMO's own TTS doesn't
+  // immediately re-fire (the response_until window helps too).
+  wake_cooldown_until_ms = millis() + 2500;
   showing_response = true;
   response_shown_at = millis();
   response_until    = millis() + RESPONSE_MAX_VISIBLE_MS;
@@ -2489,6 +2881,11 @@ void send_status_page() {
           "in text on screen (no voice yet -- that comes in Phase 9e).</p>"
           "<form action='/talk-to-bmo' method='POST'>"
           "<button type='submit'>Talk to BMO</button></form>"
+          "<form action='/toggle-listen' method='POST'>"
+          "<button type='submit'>";
+  html += (listening_mode ? "Turn always-listening OFF (require touch)"
+                          : "Turn always-listening ON (voice activated)");
+  html += "</button></form>"
           "<p><a href='/photos'>BMO's photos &rarr;</a></p>";
   html += "<h2>Settings</h2>";
   html += "<p>Quiet mode: <b>";
@@ -2572,6 +2969,11 @@ void register_status_routes() {
   });
   http_server.on("/toggle-quiet", HTTP_POST, []() {
     quiet_mode = !quiet_mode;
+    http_server.sendHeader("Location", "/", true);
+    http_server.send(302, "text/plain", "");
+  });
+  http_server.on("/toggle-listen", HTTP_POST, []() {
+    listening_mode = !listening_mode;
     http_server.sendHeader("Location", "/", true);
     http_server.send(302, "text/plain", "");
   });
@@ -2741,6 +3143,12 @@ void setup() {
     configTime(-5 * 3600, 3600, "pool.ntp.org", "time.nist.gov");
   }
 
+  // Phase 9j: load on-device wake word model ("Hi, ESP" WakeNet9).
+  // Lives in the "model" SPIFFS partition (esp_sr_16 layout). If missing or
+  // not flashed, wakenet_init() logs and we fall back to ambient threshold
+  // detection only.
+  wakenet_init();
+
   // Quiet boot sound only once we're past wifi (or in setup mode anyway)
   M5.Speaker.tone(523, 60); delay(65);
   M5.Speaker.tone(784, 80); delay(85);
@@ -2823,17 +3231,59 @@ void loop() {
   bool currently_blinking = (now < blink_until);
   bool blink_changed = (currently_blinking != was_blinking);
 
-  // Touch sensor gestures (Phase 9h -- tap-to-talk usability fix):
-  //   hold  -> start conversation (deliberate, harder to false-trigger)
-  //   tap   -> pet (heart eyes, friendly poke)
-  //   swipe -> also start conversation (keep as fallback)
-  // Triple-tap sleep removed; power-button hold already covers sleep.
+  // Touch sensor gestures:
+  //   hold       -> start conversation (deliberate, harder to false-trigger)
+  //   single tap -> pet (heart eyes, friendly poke)
+  //   double tap -> toggle always-listening mode on/off
+  //   swipe      -> also start conversation (keep as fallback)
+  // Single-tap pet is delayed ~500ms so we can disambiguate from a double-tap.
   auto& ts = M5StackChan.TouchSensor;
+  static unsigned long pending_pet_tap_ms = 0;
+  static unsigned long last_tap_ms        = 0;
+  const unsigned long  DOUBLE_TAP_WINDOW  = 500;
+
   if (ts.wasHold()) {
     conversation_pending = true;
+    pending_pet_tap_ms = 0;  // suppress any pending single-tap
+    last_tap_ms = 0;
   } else if (ts.wasClicked()) {
-    on_pet_click();
+    unsigned long t = millis();
+    if (last_tap_ms != 0 && (t - last_tap_ms) < DOUBLE_TAP_WINDOW) {
+      // Double tap -> toggle listening mode
+      listening_mode = !listening_mode;
+      Serial.printf("[touch] double-tap -> listening_mode=%d\n", (int)listening_mode);
+      M5.Speaker.setVolume(BEEP_VOLUME);
+      if (listening_mode) {
+        // Ascending two-tone "on"
+        M5.Speaker.tone(659, 90); delay(100);
+        M5.Speaker.tone(988, 110); delay(120);
+      } else {
+        // Descending two-tone "off"
+        M5.Speaker.tone(988, 90); delay(100);
+        M5.Speaker.tone(523, 130); delay(140);
+      }
+      // Brief on-screen label
+      static char ls_label[40];
+      snprintf(ls_label, sizeof(ls_label),
+               listening_mode ? "listening: ON" : "listening: OFF");
+      current_idle_label = ls_label;
+      idle_label_until = millis() + 2500;
+      // Cancel any queued pet fire
+      pending_pet_tap_ms = 0;
+      last_tap_ms = 0;
+    } else {
+      // First tap -- defer the pet so a follow-up tap can claim it as a double-tap
+      pending_pet_tap_ms = t + DOUBLE_TAP_WINDOW;
+      last_tap_ms = t;
+    }
   }
+  // Fire deferred single-tap pet if window elapsed without a second tap
+  if (pending_pet_tap_ms != 0 && millis() >= pending_pet_tap_ms) {
+    on_pet_click();
+    pending_pet_tap_ms = 0;
+    last_tap_ms = 0;
+  }
+
   if (ts.wasSwipedForward())  conversation_pending = true;
   if (ts.wasSwipedBackward()) conversation_pending = true;
 
@@ -2858,6 +3308,11 @@ void loop() {
     tone_test_pending = false;
     run_tone_only_test();
   }
+  // Always-listening: poll ambient mic for voice trigger.
+  // Must run BEFORE the conversation_pending check so it can set the flag
+  // and have it acted on this same iteration.
+  ambient_tick();
+
   // Phase 9d: full conversation flow
   if (conversation_pending) {
     conversation_pending = false;
