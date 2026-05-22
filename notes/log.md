@@ -25,7 +25,19 @@ End-to-end working:
 
 ### Open work — custom "Hey Beemo" wake word
 
-We pivoted away from Colab self-training because the microWakeWord notebook has cascading repo-drift errors (piper-sample-generator restructured, dependencies broken). Plan now: **community batch request**.
+**Latest state (end of 2026-05-21 session):**
+
+We found a community-trained **"Hey Beepoh"** model at microwakeword.com (phonetic match for "Hey Beemo"). Files are committed to `firmware/IdleLab/wakenet_model/`. TFLite Micro interpreter scaffolding is in `IdleLab.ino` gated behind `TFLM_BEEPOH_ENABLED=0`. Not active yet — see the comment block above `tflm_beepoh_init()` for the remaining work:
+
+1. Bump `OpResolver` template to ~50 slots
+2. Identify TFLite builtin opcodes 83 + 88 in `tensorflow/lite/builtin_ops.h` and add via `AddXxx()`
+3. Pass `MicroResourceVariables` container to interpreter ctor (streaming model uses var-handles)
+4. Implement the audio frontend: Hann window + 256-RFFT + 40-channel mel filterbank [125, 7500] Hz + noise reduction + PCAN gain + log scale + int8 quantization (see ESPHome `preprocessor_settings.h`)
+5. Slide-window-average last 5 inferences, fire on probability ≥ 0.97
+
+Estimated effort: **6-12 hours focused** in a fresh session.
+
+**Also valid path: community batch request.** "Hey Beepoh" has 22 false-triggers/hr — would be miserable in practice. Proper "Hey Beemo" via the HA community thread gets you ~1-2 false/hr.
 
 **Morning task for you (~5 min):**
 
