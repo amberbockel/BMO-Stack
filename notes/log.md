@@ -6,7 +6,38 @@ Newest entries on top. After every working session, append a new block: what we 
 
 ## NEXT SESSION — RESUME HERE
 
-> **Last updated 2026-05-22 — "Hey Beepoh" custom on-device wake word now works.** Commit `16aeeee`. The TFLite Micro + microfrontend + streaming-model pipeline is live alongside WakeNet9. Either phrase triggers a conversation.
+> **Last updated end of 2026-05-22.** Commit `5ae9147`. On-device "Hey Beepoh" wake word working + voice and tap "all done" gestures live + diagnostics endpoint at `bmo.local/tflm-status`.
+
+### What's working right now
+
+**Wake words (on-device, no cloud activation):**
+- **"Hey Beepoh"** (community microWakeWord model). Also fires on "Hey Beemo" / "Hey Beepho" because the threshold is lowered (peak 0.60, avg 0.35). Trade-off: occasional false triggers from random sounds.
+- **"Hi, ESP"** (WakeNet9, free Espressif model) — parallel path; either phrase wakes BMO.
+
+**Ending a conversation:**
+- **Voice**: say "all done" / "goodbye" / "thanks Beemo" / "see you later" / "stop listening" / etc. Gemini routes to `end_conversation` tool, Beemo speaks a contextual farewell, listening mode turns OFF + 30s wake cooldown.
+- **Tap once** after Beemo finishes a sentence: 1.8s window, single tap → Beemo speaks a goodbye + same shutdown.
+- **Double-tap** (during speech): abrupt abort.
+
+**Re-engaging after "all done":**
+- Hold-to-talk (~½ sec hold on touch strip) → explicit conversation, always works
+- Double-tap touch sensor → toggles always-listening back ON (you'll hear ascending two-tone "ding-DONG" + on-screen "listening: ON")
+
+### Open polish items
+
+- **Pet sound is currently silenced** (was complaining about loud sharp tones; disabled for diagnostic, never re-enabled). If you want a soft pet acknowledgment chime back, ask and I'll add a quiet F5+A5 coo with proper volume scoping.
+- **Wake-word false-trigger rate** at the current loose thresholds. If it fires on random conversation, dial peak back up from 0.60 toward 0.7 or 0.8.
+- **Proper "Hey Beemo" model** still recommended via the HA community batch request. Current model is "Hey Beepoh" trained on someone else's voice and matched loosely. Post on https://community.home-assistant.io/t/microwakeword-custom-v2-wake-words-taking-requests-12-2-only/803409 and I'll swap models in ~5 min when the trained file arrives.
+
+### Diagnostic endpoint (banked, useful next time)
+
+`http://bmo.local/tflm-status` (or 192.168.50.185) shows live:
+- TFLM interpreter shape + quantization params
+- frontend_ready, samples processed, invocations
+- last_raw_prob, last_avg_prob, max_prob_seen (probability the wake-word model produced)
+- listening_mode, wake_cooldown_remaining, showing_response, ambient_state
+
+`http://bmo.local/mww-debug` shows the latest 40-dim raw feature snapshot + quantized int8 values — useful if the model's not firing and you want to verify features are flowing.
 
 ### What works right now on BMO
 
