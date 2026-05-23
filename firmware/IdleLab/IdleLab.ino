@@ -43,6 +43,8 @@ extern "C" {
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/micro/micro_log.h"
 #include "tensorflow/lite/micro/system_setup.h"
+#include "tensorflow/lite/micro/micro_allocator.h"
+#include "tensorflow/lite/micro/micro_resource_variable.h"
 #include "wakenet_model/hey_beepoh_model.h"
 #if __has_include("gemini_credentials.h")
   #include "gemini_credentials.h"
@@ -1022,34 +1024,30 @@ static char                  wn_word_name[64] = "";
 static bool                  wn_ready      = false;
 
 // === TFLite Micro 'Hey Beepoh' interpreter setup (Phase 9j-2) ===
-// SCAFFOLDING ONLY: this is not currently active. To finish integration:
-//
-//   1. Bump OpResolver template to ~50 slots.
-//   2. Identify builtin opcodes 83 and 88 from
-//      tensorflow/lite/builtin_ops.h and add them via resolver->AddXxx().
-//   3. Pass a tflite::MicroResourceVariables container to the
-//      MicroInterpreter ctor (streaming wake-word models use stateful var
-//      handles via CALL_ONCE / VAR_HANDLE / READ/ASSIGN_VARIABLE).
-//   4. Implement the audio frontend (Hann window + 256-point RFFT + 40-
-//      channel mel filter bank in [125, 7500] Hz + noise reduction +
-//      PCAN gain control + log scale + int8 quantization). Reference
-//      esphome/components/micro_wake_word/preprocessor_settings.h for
-//      exact constants.
-//   5. Feed features in 20ms steps to interpreter->Invoke(), slide-window
-//      average last 5 probabilities, fire on >= 0.97.
-//
-// WakeNet9 'Hi, ESP' remains the daily-driver wake word until that lands.
-// Skipping init() at boot for now to avoid the noisy log lines.
-#define TFLM_BEEPOH_ENABLED 0
+// Currently we're verifying just the interpreter foundation: get
+// AllocateTensors() to succeed with all ops registered + resource variables
+// for the streaming model. Audio frontend wiring comes in a subsequent step.
+// Until step-2 (audio frontend) lands, the actual mic -> features -> invoke
+// path is not built, so WakeNet9 'Hi, ESP' remains the daily-driver wake
+// word even with TFLM_BEEPOH_ENABLED = 1.
+#define TFLM_BEEPOH_ENABLED 1
+// Result of tflm_beepoh_init for on-screen reporting since Serial is lossy
+// on this board after boot phase.
+char tflm_boot_status[60] = "tflm: not run";
+// Opcodes 83 = Pack, 88 = Unpack -- streaming models concat/split states.
+// Confirmed by inspecting tensorflow/lite/builtin_ops.h.
 namespace tflm_beepoh {
-  constexpr int kTensorArenaSize = 40 * 1024;  // 40 KB PSRAM; tune after first run
-  uint8_t* tensor_arena = nullptr;
-  const tflite::Model* model = nullptr;
+  // Streaming wake-word models need a larger arena because the resource
+  // variables (stateful tensors) live inside it across calls.
+  constexpr int kTensorArenaSize    = 80 * 1024;   // 80 KB PSRAM
+  constexpr int kNumResourceVars    = 32;          // upper bound; tune later
+  uint8_t* tensor_arena             = nullptr;
+  const tflite::Model* model        = nullptr;
+  tflite::MicroAllocator* allocator = nullptr;
+  tflite::MicroResourceVariables* resource_variables = nullptr;
   tflite::MicroInterpreter* interpreter = nullptr;
-  // Op resolver -- the actual ops needed are determined by the model
-  // architecture. The microWakeWord standard model uses streaming conv +
-  // fully connected. Add ops here as the interpreter complains about them.
-  using OpResolver = tflite::MicroMutableOpResolver<32>;
+  // 50 slots leaves headroom over the ~25-30 ops streaming models use.
+  using OpResolver = tflite::MicroMutableOpResolver<50>;
   OpResolver* resolver = nullptr;
   TfLiteTensor* input  = nullptr;
   TfLiteTensor* output = nullptr;
@@ -1059,13 +1057,16 @@ namespace tflm_beepoh {
 bool tflm_beepoh_init() {
   using namespace tflm_beepoh;
   Serial.println("[tflm] starting init...");
+  strncpy(tflm_boot_status, "tflm: alloc arena", sizeof(tflm_boot_status) - 1);
 
   // Allocate tensor arena in PSRAM
   tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_SPIRAM);
   if (!tensor_arena) {
     Serial.println("[tflm] failed to alloc tensor arena in PSRAM");
+    strncpy(tflm_boot_status, "tflm: arena alloc FAIL", sizeof(tflm_boot_status) - 1);
     return false;
   }
+  strncpy(tflm_boot_status, "tflm: arena ok, loading model", sizeof(tflm_boot_status) - 1);
 
   // Load model
   model = tflite::GetModel(hey_beepoh_tflite);
@@ -1120,14 +1121,37 @@ bool tflm_beepoh_init() {
   resolver->AddPack();
   resolver->AddUnpack();
 
-  // Build interpreter
-  interpreter = new tflite::MicroInterpreter(
-    model, *resolver, tensor_arena, kTensorArenaSize);
+  // Create allocator + resource variables BEFORE the interpreter so the
+  // streaming model's stateful var-handles have a place to live.
+  strncpy(tflm_boot_status, "tflm: making allocator", sizeof(tflm_boot_status) - 1);
+  allocator = tflite::MicroAllocator::Create(tensor_arena, kTensorArenaSize);
+  if (!allocator) {
+    Serial.println("[tflm] MicroAllocator::Create failed");
+    strncpy(tflm_boot_status, "tflm: allocator FAIL", sizeof(tflm_boot_status) - 1);
+    return false;
+  }
+  strncpy(tflm_boot_status, "tflm: making resource vars", sizeof(tflm_boot_status) - 1);
+  resource_variables = tflite::MicroResourceVariables::Create(
+    allocator, kNumResourceVars);
+  if (!resource_variables) {
+    Serial.println("[tflm] MicroResourceVariables::Create failed");
+    strncpy(tflm_boot_status, "tflm: resource vars FAIL", sizeof(tflm_boot_status) - 1);
+    return false;
+  }
+  Serial.printf("[tflm] resource vars allocated: %d slots\n", kNumResourceVars);
+  strncpy(tflm_boot_status, "tflm: building interpreter", sizeof(tflm_boot_status) - 1);
 
+  // Build interpreter using the allocator we already made
+  interpreter = new tflite::MicroInterpreter(
+    model, *resolver, allocator, resource_variables);
+
+  strncpy(tflm_boot_status, "tflm: AllocateTensors", sizeof(tflm_boot_status) - 1);
   TfLiteStatus alloc_status = interpreter->AllocateTensors();
   if (alloc_status != kTfLiteOk) {
     Serial.printf("[tflm] AllocateTensors failed: %d -- need more ops or "
                   "bigger arena\n", (int)alloc_status);
+    snprintf(tflm_boot_status, sizeof(tflm_boot_status),
+             "tflm: AllocateTensors FAIL %d", (int)alloc_status);
     return false;
   }
 
@@ -1148,6 +1172,10 @@ bool tflm_beepoh_init() {
                 (unsigned)interpreter->arena_used_bytes(), kTensorArenaSize);
   ready = true;
   Serial.println("[tflm] ready (audio frontend not yet wired)");
+  snprintf(tflm_boot_status, sizeof(tflm_boot_status),
+           "tflm: READY (in=%d out=%d)",
+           input ? (int)input->dims->data[input->dims->size - 1] : -1,
+           output ? (int)output->dims->data[output->dims->size - 1] : -1);
   return true;
 }
 
@@ -3119,6 +3147,9 @@ void register_status_routes() {
     http_server.sendHeader("Location", "/", true);
     http_server.send(302, "text/plain", "");
   });
+  http_server.on("/tflm-status", []() {
+    http_server.send(200, "text/plain", tflm_boot_status);
+  });
 
   // /photos -- HTML gallery of recent snaps (ring buffer of PHOTO_SLOT_COUNT).
   http_server.on("/photos", []() {
@@ -3286,16 +3317,15 @@ void setup() {
   }
 
   // Phase 9j: load on-device wake word model ("Hi, ESP" WakeNet9).
-  // Lives in the "model" SPIFFS partition (esp_sr_16 layout). If missing or
-  // not flashed, wakenet_init() logs and we fall back to ambient threshold
-  // detection only.
+  Serial.println(">>> before wakenet_init");
   wakenet_init();
+  Serial.println(">>> after wakenet_init");
 
   // Phase 9j-2: TFLite Micro setup for 'Hey Beepoh' (community model).
-  // Disabled until the streaming-model integration is finished (see comments
-  // above tflm_beepoh_init). Leave WakeNet9 'Hi, ESP' as the active wake word.
 #if TFLM_BEEPOH_ENABLED
+  Serial.println(">>> before tflm_beepoh_init");
   tflm_beepoh_init();
+  Serial.println(">>> after tflm_beepoh_init");
 #endif
 
   // Quiet boot sound only once we're past wifi (or in setup mode anyway)
