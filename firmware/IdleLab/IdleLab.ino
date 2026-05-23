@@ -1033,7 +1033,15 @@ static bool                  wn_ready      = false;
 // Audio frontend state -- one global instance, init at boot. Constants
 // mirrored from ESPHome's preprocessor_settings.h.
 struct FrontendState mww_frontend_state;
-bool mww_frontend_ready = false;
+bool   mww_frontend_ready = false;
+// Streaming inference state
+float  mww_prob_window[5]   = {0};  // sliding window of last 5 probabilities
+int    mww_prob_window_idx  = 0;
+size_t mww_samples_processed= 0;
+unsigned mww_invocations    = 0;
+float  mww_last_raw_prob    = 0.0f;
+float  mww_max_prob_seen    = 0.0f;
+float  mww_last_avg_prob    = 0.0f;
 
 bool mww_frontend_init() {
   struct FrontendConfig cfg = {};
@@ -1210,12 +1218,104 @@ bool tflm_beepoh_init() {
   Serial.printf("[tflm] arena used: %u / %u bytes\n",
                 (unsigned)interpreter->arena_used_bytes(), kTensorArenaSize);
   ready = true;
-  Serial.println("[tflm] ready (audio frontend not yet wired)");
+  Serial.println("[tflm] ready");
+  // Build a detailed shape string for /tflm-status
+  char in_shape[40] = "?";
+  char out_shape[40] = "?";
+  if (input) {
+    int p = 0;
+    for (int i = 0; i < input->dims->size && p < (int)sizeof(in_shape) - 8; i++) {
+      p += snprintf(in_shape + p, sizeof(in_shape) - p, "%s%d",
+                    i == 0 ? "" : "x", input->dims->data[i]);
+    }
+  }
+  if (output) {
+    int p = 0;
+    for (int i = 0; i < output->dims->size && p < (int)sizeof(out_shape) - 8; i++) {
+      p += snprintf(out_shape + p, sizeof(out_shape) - p, "%s%d",
+                    i == 0 ? "" : "x", output->dims->data[i]);
+    }
+  }
   snprintf(tflm_boot_status, sizeof(tflm_boot_status),
-           "tflm: READY (in=%d out=%d)",
-           input ? (int)input->dims->data[input->dims->size - 1] : -1,
-           output ? (int)output->dims->data[output->dims->size - 1] : -1);
+           "tflm: READY in=%s out=%s type=%d/%d",
+           in_shape, out_shape,
+           input ? (int)input->type : -1,
+           output ? (int)output->type : -1);
   return true;
+}
+
+// Feed a batch of int16 samples into the wake-word pipeline. The frontend
+// will consume them in 30ms windows with 20ms hops, emit 40-dim mel features,
+// and for each feature frame we quantize -> Invoke -> read probability ->
+// slide-window-average. Returns true if the wake word is detected this call.
+bool mww_pipeline_feed(int16_t* samples, size_t num_samples) {
+  using namespace tflm_beepoh;
+  if (!mww_frontend_ready || !ready || !interpreter || !input || !output) return false;
+  if (input->type != kTfLiteInt8 || output->type != kTfLiteUInt8) return false;
+
+  bool detected = false;
+  // Feed samples to the frontend; loop while it produces feature frames
+  // (one call may consume only part of the buffer).
+  size_t pos = 0;
+  while (pos < num_samples) {
+    size_t consumed = 0;
+    struct FrontendOutput frontend_out = FrontendProcessSamples(
+      &mww_frontend_state, samples + pos, num_samples - pos, &consumed);
+    pos += consumed;
+    if (consumed == 0) break;             // not enough samples for another window
+    if (frontend_out.size == 0) continue; // no feature this iteration
+
+    mww_samples_processed += consumed;
+
+    // Quantize the 40-dim uint16 features into the model's int8 input tensor.
+    // Following ESPHome's approach: divide by ~256 to fit into int8 range and
+    // shift by input zero point. Quantization params come from the model.
+    const float input_scale  = input->params.scale;
+    const int   input_zero   = input->params.zero_point;
+    for (int i = 0; i < 40; i++) {
+      // microfrontend emits uint16 values up to ~65535. Map to model's
+      // expected range via the per-tensor scale. q = round(x / scale) + zp.
+      float v = (float)frontend_out.values[i];
+      int q = (int)lroundf(v / (input_scale * 256.0f)) + input_zero;
+      if (q < -128) q = -128;
+      if (q >  127) q =  127;
+      input->data.int8[i] = (int8_t)q;
+    }
+
+    // Run inference
+    TfLiteStatus s = interpreter->Invoke();
+    if (s != kTfLiteOk) {
+      Serial.printf("[mww] Invoke failed: %d\n", (int)s);
+      continue;
+    }
+    mww_invocations++;
+
+    // Read output probability (uint8 -> 0..1)
+    const float out_scale = output->params.scale;
+    const int   out_zero  = output->params.zero_point;
+    const uint8_t raw     = output->data.uint8[0];
+    float prob = (raw - out_zero) * out_scale;
+    if (prob < 0.0f) prob = 0.0f;
+    if (prob > 1.0f) prob = 1.0f;
+    mww_last_raw_prob = prob;
+    if (prob > mww_max_prob_seen) mww_max_prob_seen = prob;
+
+    // Sliding window average (size = 5, from manifest)
+    mww_prob_window[mww_prob_window_idx] = prob;
+    mww_prob_window_idx = (mww_prob_window_idx + 1) % 5;
+    float avg = 0.0f;
+    for (int i = 0; i < 5; i++) avg += mww_prob_window[i];
+    avg /= 5.0f;
+    mww_last_avg_prob = avg;
+
+    // Manifest's probability_cutoff is 0.97
+    if (avg >= 0.97f) {
+      detected = true;
+      // Reset window so we don't immediately re-fire on same utterance
+      for (int i = 0; i < 5; i++) mww_prob_window[i] = 0.0f;
+    }
+  }
+  return detected;
 }
 
 bool wakenet_init() {
@@ -2635,19 +2735,28 @@ void ambient_tick() {
   if (wn_ready && wn_iface && wn_data && wn_chunk_size > 0) {
     while (ambient_wn_processed + (size_t)wn_chunk_size <= got) {
       int16_t* chunk = audio_buffer + ambient_wn_processed;
+      // Run WakeNet 'Hi, ESP' detector
       wakenet_state_t st = wn_iface->detect(wn_data, chunk);
+      // ALSO run microWakeWord 'Hey Beepoh' on the same chunk -- both compete
+      // to fire. Whichever triggers first wins. This lets us keep 'Hi, ESP'
+      // as a stable fallback while iterating on 'Hey Beepoh' threshold.
+#if TFLM_BEEPOH_ENABLED
+      bool mww_hit = mww_pipeline_feed(chunk, wn_chunk_size);
+#else
+      bool mww_hit = false;
+#endif
       ambient_wn_processed += wn_chunk_size;
-      if (st == WAKENET_DETECTED) {
-        Serial.printf("[wn] WAKE WORD DETECTED ('%s') at sample %u\n",
-                      wn_word_name, (unsigned)ambient_wn_processed);
+      const bool wn_hit = (st == WAKENET_DETECTED);
+      if (wn_hit || mww_hit) {
+        Serial.printf("[wake] %s detected at sample %u\n",
+                      wn_hit ? "WakeNet 'Hi, ESP'" : "mWakeWord 'Hey Beepoh'",
+                      (unsigned)ambient_wn_processed);
         M5.Mic.end();
         ambient_state        = AmbientState::IDLE;
-        // Don't pre-capture: we want a fresh listen for the user's actual prompt.
         audio_pre_captured   = false;
         pre_captured_samples = 0;
-        current_turn_ambient = false;  // skip Gemini address check -- WakeNet already confirmed
+        current_turn_ambient = false;  // skip Gemini address check
         conversation_pending = true;
-        // Refractory window so we don't immediately re-detect from residual audio.
         wake_cooldown_until_ms = millis() + 1500;
         return;
       }
@@ -3187,7 +3296,18 @@ void register_status_routes() {
     http_server.send(302, "text/plain", "");
   });
   http_server.on("/tflm-status", []() {
-    http_server.send(200, "text/plain", tflm_boot_status);
+    char body[300];
+    snprintf(body, sizeof(body),
+             "%s\nfrontend_ready=%d samples=%u invocations=%u "
+             "last_raw_prob=%.3f last_avg_prob=%.3f max_prob_seen=%.3f\n",
+             tflm_boot_status,
+             (int)mww_frontend_ready,
+             (unsigned)mww_samples_processed,
+             mww_invocations,
+             mww_last_raw_prob,
+             mww_last_avg_prob,
+             mww_max_prob_seen);
+    http_server.send(200, "text/plain", body);
   });
 
   // /photos -- HTML gallery of recent snaps (ring buffer of PHOTO_SLOT_COUNT).
