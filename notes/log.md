@@ -6,7 +6,39 @@ Newest entries on top. After every working session, append a new block: what we 
 
 ## NEXT SESSION — RESUME HERE
 
-> Pinned section. Read this first when you come back. **Last updated 2026-05-21 overnight after an autonomous attempt to integrate the 'Hey Beepoh' wake word.** Live firmware still has the working WakeNet9 'Hi, ESP' wake word; the overnight attempt stalled at Phase A with reference files vendored but not yet wired into the build. Latest commit: `a6871f3`.
+> **Last updated 2026-05-22 — "Hey Beepoh" custom on-device wake word now works.** Commit `16aeeee`. The TFLite Micro + microfrontend + streaming-model pipeline is live alongside WakeNet9. Either phrase triggers a conversation.
+
+### What works right now on BMO
+
+**On-device wake words (no cloud call for activation):**
+- **"Hey Beepoh"** — community-trained microWakeWord model running through our vendored TF audio_microfrontend + TFLite Micro interpreter
+- **"Hi, ESP"** — Espressif's pre-trained WakeNet9 model (kept as parallel/fallback path; if false-triggers become annoying, drop it from `ambient_tick`)
+
+**Everything else** (from prior sessions): hold-to-talk, double-tap toggle, photos via Gemini Vision, tool routing (color/weather/time/dance/battery/see_scene), Beemo personality voice, responsiveness improvements (VAD, live reactivity, ack tones, tighter idle).
+
+### How the wake-word integration was solved (key facts to bank)
+
+The integration came together in one session after weeks of overestimating:
+
+1. **Partition table**: switched to `esp_sr_16` (M5Stack bundles this). Provides 3MB app + 3MB model partition at 0xD10000.
+2. **WakeNet9 model**: `srmodels.bin` from M5Stack package flashed to model partition via esptool. Contains only `wn9_hiesp` ("Hi, ESP").
+3. **Custom microWakeWord model**: `firmware/IdleLab/wakenet_model/hey_beepoh.tflite` (53KB) embedded as a C byte array via `xxd -i`. Closest community phrase to "Hey Beemo" found at https://microwakeword.com/library .
+4. **Audio frontend**: TensorFlow's `audio_microfrontend` library + kissfft vendored into `firmware/IdleLab/src/microfrontend/`. Arduino IDE auto-compiles .c/.cc under `src/`. Files meant to be `#include`d as source-into-namespace must be renamed to `.h` extensions (kiss_fft.c -> kiss_fft_impl.h) so Arduino doesn't try to compile them standalone. Relative includes need `../` to avoid resolving to bundled tflite-micro third_party kissfft.
+5. **TFLM streaming model**: needs `MicroResourceVariables` allocated via a shared `MicroAllocator`. The simple `MicroInterpreter(model, resolver, arena, size)` ctor won't work for streaming models. OpResolver template size needs to be ~50 slots (model uses ~30 ops including Pack=83, Unpack=88, Conv2D, FullyConnected, CallOnce, VarHandle, ReadVariable, AssignVariable, Add, Mul, etc.).
+6. **Feature quantization (the gotcha that took the longest)**: do NOT use the tflite's `params.scale` / `params.zero_point` for input quantization. Use ESPHome's exact formula from `generate_features_()`:
+   ```c
+   q = (raw_uint16 * 256 + 333) / 666 + INT8_MIN  // clamp to int8
+   ```
+   Constants 256 and 666 (=25.6×26.0) are baked into the training pipeline.
+
+### Optional next step — proper "Hey Beemo" model
+
+"Hey Beepoh" works but isn't the phrase you actually want. If you'd rather have a proper "Hey Beemo":
+
+1. Post on https://community.home-assistant.io/t/microwakeword-custom-v2-wake-words-taking-requests-12-2-only/803409
+2. Request `Hey Beemo` (ESP32-S3 / TFLite Micro)
+3. Wait days-to-weeks for batch training
+4. When the `.tflite` arrives, drop into `firmware/IdleLab/wakenet_model/`, regenerate `hey_beepoh_model.h` via `xxd -i`, recompile. ~5 min swap.
 
 ### Overnight autonomous attempt — what happened (good faith honest summary)
 
