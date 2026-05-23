@@ -1042,6 +1042,13 @@ unsigned mww_invocations    = 0;
 float  mww_last_raw_prob    = 0.0f;
 float  mww_max_prob_seen    = 0.0f;
 float  mww_last_avg_prob    = 0.0f;
+// Snapshot of latest features + quantization params, exposed via /mww-debug
+uint16_t mww_last_feat[40]  = {0};
+int8_t   mww_last_q[40]     = {0};
+float    mww_input_scale    = 0.0f;
+int      mww_input_zero     = 0;
+float    mww_output_scale   = 0.0f;
+int      mww_output_zero    = 0;
 
 bool mww_frontend_init() {
   struct FrontendConfig cfg = {};
@@ -1268,18 +1275,39 @@ bool mww_pipeline_feed(int16_t* samples, size_t num_samples) {
     mww_samples_processed += consumed;
 
     // Quantize the 40-dim uint16 features into the model's int8 input tensor.
-    // Following ESPHome's approach: divide by ~256 to fit into int8 range and
-    // shift by input zero point. Quantization params come from the model.
-    const float input_scale  = input->params.scale;
-    const int   input_zero   = input->params.zero_point;
+    // microWakeWord training quantizes mel features as:
+    //   q = round(feature * (1/scale)) + zero_point
+    // where features are already scaled by /256 inside the model assumption,
+    // OR features are fed at full uint16 range. The tflite's stored scale +
+    // zero_point describe how the model interprets q -> float. Standard
+    // formula: x = (q - zero_point) * scale, so q = round(x/scale) + zero.
+    // We treat the frontend's uint16 output AS the "x" the model expects.
+    mww_input_scale  = input->params.scale;
+    mww_input_zero   = input->params.zero_point;
+    mww_output_scale = output->params.scale;
+    mww_output_zero  = output->params.zero_point;
+    const float input_scale = mww_input_scale > 0 ? mww_input_scale : 1.0f;
+    const int   input_zero  = mww_input_zero;
+    // Quantization formula from ESPHome's micro_wake_word.cpp generate_features_():
+    //   value = (raw * 256 + (666/2)) / 666 + INT8_MIN
+    //   clamp to int8
+    // This is a FIXED transform (constants 256 and 666 = 25.6 * 26.0), not
+    // derived from the tflite's per-tensor scale/zero_point. The model was
+    // trained with this specific quantization, hence the model's stored
+    // scale/zero are essentially decorative for this op.
+    (void)input_scale;
+    (void)input_zero;
+    const int32_t value_scale = 256;
+    const int32_t value_div   = 666;
     for (int i = 0; i < 40; i++) {
-      // microfrontend emits uint16 values up to ~65535. Map to model's
-      // expected range via the per-tensor scale. q = round(x / scale) + zp.
-      float v = (float)frontend_out.values[i];
-      int q = (int)lroundf(v / (input_scale * 256.0f)) + input_zero;
-      if (q < -128) q = -128;
-      if (q >  127) q =  127;
-      input->data.int8[i] = (int8_t)q;
+      uint16_t raw = frontend_out.values[i];
+      mww_last_feat[i] = raw;
+      int32_t v = ((int32_t)raw * value_scale + (value_div / 2)) / value_div;
+      v += INT8_MIN;
+      if (v < -128) v = -128;
+      if (v >  127) v =  127;
+      input->data.int8[i] = (int8_t)v;
+      mww_last_q[i] = (int8_t)v;
     }
 
     // Run inference
@@ -3296,17 +3324,32 @@ void register_status_routes() {
     http_server.send(302, "text/plain", "");
   });
   http_server.on("/tflm-status", []() {
-    char body[300];
+    char body[400];
     snprintf(body, sizeof(body),
              "%s\nfrontend_ready=%d samples=%u invocations=%u "
+             "in_scale=%.6f in_zero=%d out_scale=%.6f out_zero=%d\n"
              "last_raw_prob=%.3f last_avg_prob=%.3f max_prob_seen=%.3f\n",
              tflm_boot_status,
              (int)mww_frontend_ready,
              (unsigned)mww_samples_processed,
              mww_invocations,
-             mww_last_raw_prob,
-             mww_last_avg_prob,
-             mww_max_prob_seen);
+             mww_input_scale, mww_input_zero,
+             mww_output_scale, mww_output_zero,
+             mww_last_raw_prob, mww_last_avg_prob, mww_max_prob_seen);
+    http_server.send(200, "text/plain", body);
+  });
+  http_server.on("/mww-debug", []() {
+    char body[1200];
+    int p = 0;
+    p += snprintf(body + p, sizeof(body) - p, "feat raw:");
+    for (int i = 0; i < 40; i++) {
+      p += snprintf(body + p, sizeof(body) - p, " %u", (unsigned)mww_last_feat[i]);
+    }
+    p += snprintf(body + p, sizeof(body) - p, "\nfeat q:");
+    for (int i = 0; i < 40; i++) {
+      p += snprintf(body + p, sizeof(body) - p, " %d", (int)mww_last_q[i]);
+    }
+    p += snprintf(body + p, sizeof(body) - p, "\n");
     http_server.send(200, "text/plain", body);
   });
 
