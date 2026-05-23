@@ -46,6 +46,13 @@ extern "C" {
 #include "tensorflow/lite/micro/micro_allocator.h"
 #include "tensorflow/lite/micro/micro_resource_variable.h"
 #include "wakenet_model/hey_beepoh_model.h"
+
+// Audio frontend: produces 40-dim mel features that the wake-word model
+// expects. Constants from ESPHome's preprocessor_settings.h.
+extern "C" {
+  #include "src/microfrontend/frontend.h"
+  #include "src/microfrontend/frontend_util.h"
+}
 #if __has_include("gemini_credentials.h")
   #include "gemini_credentials.h"
 #endif
@@ -1022,6 +1029,38 @@ static model_iface_data_t*   wn_data       = nullptr;
 static int                   wn_chunk_size = 0;
 static char                  wn_word_name[64] = "";
 static bool                  wn_ready      = false;
+
+// Audio frontend state -- one global instance, init at boot. Constants
+// mirrored from ESPHome's preprocessor_settings.h.
+struct FrontendState mww_frontend_state;
+bool mww_frontend_ready = false;
+
+bool mww_frontend_init() {
+  struct FrontendConfig cfg = {};
+  cfg.window.size_ms                       = 30;        // FEATURE_DURATION_MS
+  cfg.window.step_size_ms                  = 20;        // features_step_size_
+  cfg.filterbank.num_channels              = 40;        // PREPROCESSOR_FEATURE_SIZE
+  cfg.filterbank.lower_band_limit          = 125.0f;
+  cfg.filterbank.upper_band_limit          = 7500.0f;
+  cfg.noise_reduction.smoothing_bits       = 10;
+  cfg.noise_reduction.even_smoothing       = 0.025f;
+  cfg.noise_reduction.odd_smoothing        = 0.06f;
+  cfg.noise_reduction.min_signal_remaining = 0.05f;
+  cfg.pcan_gain_control.enable_pcan        = 1;
+  cfg.pcan_gain_control.strength           = 0.95f;
+  cfg.pcan_gain_control.offset             = 80.0f;
+  cfg.pcan_gain_control.gain_bits          = 21;
+  cfg.log_scale.enable_log                 = 1;
+  cfg.log_scale.scale_shift                = 6;
+  const int sample_rate = 16000;
+  if (!FrontendPopulateState(&cfg, &mww_frontend_state, sample_rate)) {
+    Serial.println("[mww-fe] FrontendPopulateState failed");
+    return false;
+  }
+  mww_frontend_ready = true;
+  Serial.println("[mww-fe] frontend ready");
+  return true;
+}
 
 // === TFLite Micro 'Hey Beepoh' interpreter setup (Phase 9j-2) ===
 // Currently we're verifying just the interpreter foundation: get
@@ -3325,6 +3364,7 @@ void setup() {
 #if TFLM_BEEPOH_ENABLED
   Serial.println(">>> before tflm_beepoh_init");
   tflm_beepoh_init();
+  mww_frontend_init();
   Serial.println(">>> after tflm_beepoh_init");
 #endif
 

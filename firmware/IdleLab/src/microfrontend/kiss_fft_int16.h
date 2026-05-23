@@ -16,7 +16,7 @@ limitations under the License.
 #ifndef TENSORFLOW_LITE_EXPERIMENTAL_MICROFRONTEND_LIB_KISS_FFT_INT16_H_
 #define TENSORFLOW_LITE_EXPERIMENTAL_MICROFRONTEND_LIB_KISS_FFT_INT16_H_
 
-#include "tensorflow/lite/experimental/microfrontend/lib/kiss_fft_common.h"
+#include "kiss_fft_common.h"
 
 // Wrap 16-bit kiss fft in its own namespace. Enables us to link an application
 // with different kiss fft resolutions (16/32 bit integer, float, double)
