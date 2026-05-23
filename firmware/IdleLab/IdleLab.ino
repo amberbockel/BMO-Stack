@@ -824,10 +824,13 @@ void on_pet_click() {
   // Soft pink LED pulse to match the hearts
   set_led_override(255, 105, 160, 2000, false);
 
-  current_idle_label = "love!";
+  current_idle_label = "love-silent";  // DIAGNOSTIC: pet tone removed
   idle_label_until   = millis() + 1500;
-  M5.Speaker.tone(880, 60); delay(70);
-  M5.Speaker.tone(1047, 80); delay(85);
+  // Pet sound DISABLED for one test cycle. If tap still produces a loud
+  // noise, it's the wake word's "get ready" cue firing on the tap's
+  // acoustic transient -- means we need stricter thresholds, not a quieter
+  // pet sound. If tap is now silent, the previous loudness was the pet
+  // tone after all and we re-enable with even softer settings.
   last_interaction_ms = millis();
 }
 
@@ -916,16 +919,26 @@ void draw_sleep_face() {
   face_buffer.pushSprite(&M5StackChan.Display(), 0, 0);
 }
 
-// === Double-tap-to-abort during conversation ===
-// User can double-tap the touch sensor while BMO is speaking/listening to
-// cut the conversation short. Polled from the listen and playback loops.
-volatile bool conversation_abort = false;
-unsigned long last_abort_tap_ms = 0;
+// === In-conversation tap gestures ===
+// SINGLE tap (during conversation) -> "all done" gesture. BMO finishes its
+//   current speech, says a brief goodbye, exits the multi-turn loop cleanly.
+// DOUBLE tap (during conversation) -> hard abort. Cuts speech mid-word.
+// Disambiguation: a tap is treated as "single" only after the ~600ms
+// double-tap window has elapsed without a second tap.
+volatile bool  conversation_abort        = false;
+volatile bool  conversation_done_pending = false;
+// Set when end_conversation tool already spoke the farewell -- the post-speech
+// done handler should skip re-synthesizing a goodbye and just clean up.
+volatile bool  conversation_done_via_voice = false;
+unsigned long  last_abort_tap_ms         = 0;
+unsigned long  pending_done_tap_at_ms    = 0;
 
+// During listening/playback: ONLY a double tap aborts. Single taps are
+// ignored here -- they get handled by poll_done_after_speech() between turns.
 bool poll_abort_double_tap() {
   M5StackChan.update();
+  unsigned long now = millis();
   if (M5StackChan.TouchSensor.wasClicked()) {
-    unsigned long now = millis();
     if (last_abort_tap_ms != 0 && (now - last_abort_tap_ms) < 600) {
       conversation_abort = true;
       last_abort_tap_ms = 0;
@@ -935,6 +948,44 @@ bool poll_abort_double_tap() {
     last_abort_tap_ms = now;
   }
   return false;
+}
+
+// Called in the window AFTER Beemo finishes speaking, BEFORE the next
+// turn opens the mic. Resolves a tap as single = DONE or double = ABORT.
+// Keeps polling until either (a) the window expires with no tap, or
+// (b) a tap is fully resolved (waited 600ms for a possible second tap).
+bool poll_done_after_speech(unsigned long window_ms) {
+  unsigned long start = millis();
+  // If a tap happened during the just-finished speech, poll_abort_double_tap
+  // recorded it in last_abort_tap_ms and consumed the wasClicked event.
+  // Pick it up as our "first tap" here so we don't lose it.
+  unsigned long first_tap_at = 0;
+  if (last_abort_tap_ms != 0 && (start - last_abort_tap_ms) < 600) {
+    first_tap_at = last_abort_tap_ms;
+    Serial.printf("[done] inheriting tap from speech at %lu (now %lu)\n",
+                  last_abort_tap_ms, start);
+  }
+  while (true) {
+    M5StackChan.update();
+    unsigned long now = millis();
+    if (M5StackChan.TouchSensor.wasClicked()) {
+      if (first_tap_at != 0 && (now - first_tap_at) < 600) {
+        conversation_abort = true;
+        Serial.println("[abort] double-tap in done window");
+        return true;
+      }
+      first_tap_at = now;
+      last_abort_tap_ms = now;
+    }
+    if (first_tap_at != 0 && (now - first_tap_at) >= 600) {
+      conversation_done_pending = true;
+      Serial.println("[done] single-tap after speech -> wrap up");
+      return true;
+    }
+    // Exit only if (a) no tap registered AND (b) full window has passed.
+    if (first_tap_at == 0 && (now - start) >= window_ms) return false;
+    delay(20);
+  }
 }
 
 // === Triple-tap detection -> sleep ===
@@ -1336,8 +1387,15 @@ bool mww_pipeline_feed(int16_t* samples, size_t num_samples) {
     avg /= 5.0f;
     mww_last_avg_prob = avg;
 
-    // Manifest's probability_cutoff is 0.97
-    if (avg >= 0.97f) {
+    // Detection threshold. Manifest says 0.97 for "Hey Beepoh" exact phrase
+    // but Amber says "Hey Beemo" which doesn't match perfectly -- her best
+    // attempts only reach ~0.65 peak. Lowered thresholds to catch her voice;
+    // expect more false triggers until a proper "Hey Beemo" model is trained.
+    //   - AVG over 5 frames >= 0.35 (was 0.55)
+    //   - OR any single RAW frame >= 0.60 (was 0.85)
+    const float MWW_AVG_THRESHOLD  = 0.35f;
+    const float MWW_PEAK_THRESHOLD = 0.60f;
+    if (avg >= MWW_AVG_THRESHOLD || prob >= MWW_PEAK_THRESHOLD) {
       detected = true;
       // Reset window so we don't immediately re-fire on same utterance
       for (int i = 0; i < 5; i++) mww_prob_window[i] = 0.0f;
@@ -1563,6 +1621,11 @@ const char* BMO_SYSTEM_PROMPT =
   "- see_scene whenever the user asks Beemo to see/look/look around/describe/"
   "  take a picture/take a photo/what's in front of you/can you see me. Beemo "
   "  has a forward camera. "
+  "- end_conversation whenever the user signals they're done talking. "
+  "  Triggers: 'all done', 'I'm done', 'we're done', 'goodbye', 'bye Beemo', "
+  "  'thanks Beemo', 'thank you Beemo', 'see you later', 'see ya', "
+  "  'that's it', 'stop listening', 'go to sleep', 'log off'. Provide a "
+  "  short warm farewell as the 'farewell' arg. "
   "Do NOT pretend the request can't be done. Do NOT just respond with words "
   "when a tool exists for the request. The tool returns immediately; just call it. "
   "If the request is ambiguous (e.g. 'change your color' with no color named), "
@@ -1578,6 +1641,9 @@ const char* BMO_SYSTEM_PROMPT =
   "User: 'take a picture' -> CALL see_scene "
   "User: 'look at me' -> CALL see_scene(focus='the person in front') "
   "User: 'how charged are you' -> CALL get_battery_level "
+  "User: 'all done Beemo' -> CALL end_conversation(farewell='Okay Amber. Beemo is signing off.') "
+  "User: 'thanks Beemo' -> CALL end_conversation(farewell='Anytime. Bye.') "
+  "User: 'goodbye' -> CALL end_conversation(farewell='Bye Amber.') "
   "User: 'what is a rainbow?' -> reply in text: 'Rainbows. Sky having an "
   "emotional moment in public. Beemo respects this.' "
   "Keep replies short (1-2 sentences), dry, observational. No markdown -- you "
@@ -1809,7 +1875,7 @@ String describe_scene(const char* user_prompt) {
   return desc;
 }
 
-const char* TOOLS_JSON = R"TOOLS("tools":[{"functionDeclarations":[{"name":"set_led_color","description":"CALL THIS whenever the user asks BMO to change its lights, LEDs, glow, color, illumination, etc. Examples: 'turn your lights red', 'make yourself blue', 'glow purple', 'change color to green'.","parameters":{"type":"object","properties":{"color":{"type":"string","description":"Color name: red, blue, green, yellow, purple, pink, orange, cyan, white, or off."}},"required":["color"]}},{"name":"play_gesture","description":"CALL THIS whenever the user asks BMO to physically do something: dance, bounce, wiggle, sigh, blink, stretch, tilt head, etc. Examples: 'BMO dance!', 'do a happy bounce', 'wiggle for me'.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"Gesture: dance, wiggle, happy_bounce, sigh, blink, stretch, curious_tilt."}},"required":["name"]}},{"name":"get_battery_level","description":"CALL THIS when user asks about BMO battery, charge level, how charged BMO is.","parameters":{"type":"object","properties":{}}},{"name":"get_time","description":"CALL THIS when user asks for current date, time, day of week, what day it is.","parameters":{"type":"object","properties":{}}},{"name":"get_weather","description":"CALL THIS whenever the user asks about weather, temperature, conditions, forecast, sky, or 'what's it like outside' for any location. Examples: 'whats the weather in Concord Mass', 'is it raining in Tokyo', 'how hot is Boston'.","parameters":{"type":"object","properties":{"city":{"type":"string","description":"City name with optional state/country e.g. 'Boston', 'Concord,MA', 'Tokyo'."}},"required":["city"]}},{"name":"see_scene","description":"CALL THIS whenever the user asks Beemo to look, see, look around, describe what Beemo sees, take a picture, take a photo, what's in front of you, can you see me, look at this. Beemo has a small forward camera. Examples: 'Beemo, what do you see?', 'look at me', 'take a picture', 'what's in front of you?', 'describe what you see'.","parameters":{"type":"object","properties":{"focus":{"type":"string","description":"Optional brief hint about what to pay attention to, e.g. 'the person in front of you', 'the room', 'this object'. Empty string if user didn't specify."}}}}]}],)TOOLS";
+const char* TOOLS_JSON = R"TOOLS("tools":[{"functionDeclarations":[{"name":"set_led_color","description":"CALL THIS whenever the user asks BMO to change its lights, LEDs, glow, color, illumination, etc. Examples: 'turn your lights red', 'make yourself blue', 'glow purple', 'change color to green'.","parameters":{"type":"object","properties":{"color":{"type":"string","description":"Color name: red, blue, green, yellow, purple, pink, orange, cyan, white, or off."}},"required":["color"]}},{"name":"play_gesture","description":"CALL THIS whenever the user asks BMO to physically do something: dance, bounce, wiggle, sigh, blink, stretch, tilt head, etc. Examples: 'BMO dance!', 'do a happy bounce', 'wiggle for me'.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"Gesture: dance, wiggle, happy_bounce, sigh, blink, stretch, curious_tilt."}},"required":["name"]}},{"name":"get_battery_level","description":"CALL THIS when user asks about BMO battery, charge level, how charged BMO is.","parameters":{"type":"object","properties":{}}},{"name":"get_time","description":"CALL THIS when user asks for current date, time, day of week, what day it is.","parameters":{"type":"object","properties":{}}},{"name":"get_weather","description":"CALL THIS whenever the user asks about weather, temperature, conditions, forecast, sky, or 'what's it like outside' for any location. Examples: 'whats the weather in Concord Mass', 'is it raining in Tokyo', 'how hot is Boston'.","parameters":{"type":"object","properties":{"city":{"type":"string","description":"City name with optional state/country e.g. 'Boston', 'Concord,MA', 'Tokyo'."}},"required":["city"]}},{"name":"see_scene","description":"CALL THIS whenever the user asks Beemo to look, see, look around, describe what Beemo sees, take a picture, take a photo, what's in front of you, can you see me, look at this. Beemo has a small forward camera. Examples: 'Beemo, what do you see?', 'look at me', 'take a picture', 'what's in front of you?', 'describe what you see'.","parameters":{"type":"object","properties":{"focus":{"type":"string","description":"Optional brief hint about what to pay attention to, e.g. 'the person in front of you', 'the room', 'this object'. Empty string if user didn't specify."}}}},{"name":"end_conversation","description":"CALL THIS when the user signals they are done talking and want to end this chat. Triggers: 'all done', 'I'm done', 'goodbye', 'goodbye Beemo', 'bye Beemo', 'thanks Beemo', 'thank you Beemo', 'see you later', 'see ya', 'that's it', 'we are done', 'stop listening', 'go to sleep', 'log off'. After calling, Beemo will say the farewell and stop listening until the user re-engages.","parameters":{"type":"object","properties":{"farewell":{"type":"string","description":"A short, warm Beemo-voice goodbye (1 short sentence). E.g. 'Okay Amber. Beemo is signing off.' or 'Cool, bye.'"}},"required":["farewell"]}}]}],)TOOLS";
 
 // Execute a tool the LLM asked for. Returns a short string describing what
 // happened, which we send back to Gemini as the function's response so it
@@ -1983,6 +2049,26 @@ String execute_tool(const String& fn_name, const String& args_json) {
       ? "What do you see? Focus on: " + focus
       : "What do you see right now?";
     return describe_scene(prompt.c_str());
+  }
+
+  if (fn_name == "end_conversation") {
+    // Extract the farewell text from args. If missing, fall back to a default.
+    String farewell;
+    int fs = args_json.indexOf("\"farewell\":");
+    if (fs >= 0) {
+      int q1 = args_json.indexOf('"', fs + 11);
+      int q2 = args_json.indexOf('"', q1 + 1);
+      if (q1 >= 0 && q2 >= 0) farewell = args_json.substring(q1 + 1, q2);
+    }
+    if (farewell.length() == 0) {
+      farewell = "Okay. Beemo is logging off. Bye Amber.";
+    }
+    // Signal the conversation loop to wrap up after speaking this farewell.
+    // The flag tells the done handler that the goodbye is already in the
+    // response pipeline; it should skip re-synthesizing another one.
+    conversation_done_pending = true;
+    conversation_done_via_voice = true;
+    return farewell;
   }
 
   return "unknown function: " + fn_name;
@@ -2354,6 +2440,11 @@ bool call_gemini_with_audio() {
                                  "Sky reports in.";
     } else if (fn_name == "see_scene") {
       // Vision call already returned BMO-styled prose; speak it as-is.
+      reply = tool_result;
+    } else if (fn_name == "end_conversation") {
+      // Farewell from the tool; speak it as-is. The done flag is already set
+      // inside execute_tool so the post-speech handler will wrap up cleanly
+      // without speaking a second goodbye.
       reply = tool_result;
     } else {
       reply = "BMO did it! Yay! ";
@@ -2840,7 +2931,10 @@ void run_conversation() {
   last_interaction_ms = millis();
   session_history = "";
   conversation_abort = false;
+  conversation_done_pending = false;
+  conversation_done_via_voice = false;
   last_abort_tap_ms = 0;
+  pending_done_tap_at_ms = 0;
   const int MAX_TURNS = 10;
   const int SILENCE_PEAK_THRESHOLD = 1500;  // peak below this = "user didn't speak"
 
@@ -3096,13 +3190,41 @@ void run_conversation() {
     if (tts_samples > 0) play_with_mouth_sync(tts_samples);
     if (conversation_abort) break;
 
-    // Brief pause before opening mic for the next turn
-    delay(600);
+    // ===== "All done" gesture handler =====
+    // Window AFTER speech where a single tap = done, double tap = abort.
+    // Outside this window taps are only treated as abort (double-tap), so
+    // accidental touches during listening don't end the conversation.
+    poll_done_after_speech(1800);
+    if (conversation_abort) break;
+    if (conversation_done_pending) {
+      // If the voice path (end_conversation tool) already produced+spoke a
+      // farewell, skip re-synthesizing another goodbye. Otherwise (tap
+      // gesture path), speak a generic Beemo-voice goodbye now.
+      if (!conversation_done_via_voice) {
+        static const char* goodbye_variants[] = {
+          "Okay. Beemo enjoyed that. Tap when you want to chat again.",
+          "Done. Beemo is going back to lurking. Bye Amber.",
+          "Cool. Beemo's logging off the conversation. Find me later."
+        };
+        int gv = random(0, 3);
+        strncpy(response_text, goodbye_variants[gv], RESPONSE_TEXT_MAX - 1);
+        response_text[RESPONSE_TEXT_MAX - 1] = 0;
+        size_t bye_samples = synthesize_speech(response_text);
+        if (bye_samples > 0) play_with_mouth_sync(bye_samples);
+      }
+      // Surefire shutdown: turn always-listening OFF entirely AND set a
+      // long wake cooldown. Re-engage by either double-tapping (toggles
+      // listening back ON) or holding to talk (explicit conversation).
+      listening_mode = false;
+      wake_cooldown_until_ms = millis() + 30000;
+      break;
+    }
+
     last_interaction_ms = millis();
   }
 
   if (conversation_abort) {
-    snprintf(response_text, RESPONSE_TEXT_MAX, "(Okay! BMO will be quiet.)");
+    snprintf(response_text, RESPONSE_TEXT_MAX, "(Okay! Beemo will be quiet.)");
   }
 
   // ===== End-of-conversation screen =====
@@ -3110,8 +3232,10 @@ void run_conversation() {
   if (!led_override_sticky) led_override_active = false;
   face_override_active = false;
   // Suppress wake-word re-detection for a moment so BMO's own TTS doesn't
-  // immediately re-fire (the response_until window helps too).
-  wake_cooldown_until_ms = millis() + 2500;
+  // immediately re-fire (the response_until window helps too). Don't shorten
+  // a longer cooldown set earlier (e.g. by the "all done" gesture).
+  unsigned long short_cool = millis() + 2500;
+  if (short_cool > wake_cooldown_until_ms) wake_cooldown_until_ms = short_cool;
   showing_response = true;
   response_shown_at = millis();
   response_until    = millis() + RESPONSE_MAX_VISIBLE_MS;
@@ -3324,18 +3448,23 @@ void register_status_routes() {
     http_server.send(302, "text/plain", "");
   });
   http_server.on("/tflm-status", []() {
-    char body[400];
+    char body[500];
+    long cooldown_ms = (long)wake_cooldown_until_ms - (long)millis();
     snprintf(body, sizeof(body),
              "%s\nfrontend_ready=%d samples=%u invocations=%u "
              "in_scale=%.6f in_zero=%d out_scale=%.6f out_zero=%d\n"
-             "last_raw_prob=%.3f last_avg_prob=%.3f max_prob_seen=%.3f\n",
+             "last_raw_prob=%.3f last_avg_prob=%.3f max_prob_seen=%.3f\n"
+             "listening_mode=%d wake_cooldown_remaining=%ldms "
+             "showing_response=%d ambient_state=%d\n",
              tflm_boot_status,
              (int)mww_frontend_ready,
              (unsigned)mww_samples_processed,
              mww_invocations,
              mww_input_scale, mww_input_zero,
              mww_output_scale, mww_output_zero,
-             mww_last_raw_prob, mww_last_avg_prob, mww_max_prob_seen);
+             mww_last_raw_prob, mww_last_avg_prob, mww_max_prob_seen,
+             (int)listening_mode, cooldown_ms > 0 ? cooldown_ms : 0,
+             (int)showing_response, (int)ambient_state);
     http_server.send(200, "text/plain", body);
   });
   http_server.on("/mww-debug", []() {
