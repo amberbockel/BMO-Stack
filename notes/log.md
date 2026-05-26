@@ -6,7 +6,49 @@ Newest entries on top. After every working session, append a new block: what we 
 
 ## NEXT SESSION — RESUME HERE
 
-> **Last updated end of 2026-05-22.** Commit `5ae9147`. On-device "Hey Beepoh" wake word working + voice and tap "all done" gestures live + diagnostics endpoint at `bmo.local/tflm-status`.
+> **Last updated 2026-05-25.** Commit `98ad049`. Beemo has a secret life — full-screen BMO GIFs play when idle, also testable via web buttons. Conversations are single-turn now.
+
+### What changed this session
+
+- **Beemo's secret life**: after 2 min of idle (or via test buttons at `bmo.local/`), Beemo plays one of 5 routines — karate, soccer, dance, meditation, or random (4-GIF pool). Each routine combines a full-screen 320×240 BMO GIF + head/body motion + LED color pulses. **Silent** — no chiptune sounds during routines.
+- **GIF playback pipeline**: `scripts/gif_to_header.py` converts a GIF/WEBP into a C header (JPEG frame array + Animation struct). Run with `--cover` to fill the screen and crop overflow. Re-run any time you want to swap GIFs.
+- **Single-turn conversations** (was multi-turn). After "Hey Beemo, X" → Beemo responds once and stops. Re-engage by wake word or hold-to-talk. Fixed the back-to-back re-triggering bug where BMO's own audio echoes would re-fire the conversation.
+- **"All done" gesture + voice command** (from earlier in the session). Tap once after Beemo speaks OR say "all done" / "goodbye" / "thanks Beemo" → graceful exit, listening mode turns off, 30s wake cooldown.
+
+### What's live and working
+
+- **Wake words** (on-device): "Hey Beepoh" + "Hi, ESP" both fire
+- **Single-turn conversations** with Beemo personality + all tools (set_led_color, play_gesture, get_battery_level, get_time, get_weather, see_scene, end_conversation)
+- **Secret life routines** (idle behavior with GIFs)
+- **Photos via Gemini Vision** ("Beemo what do you see?")
+- **Always-listening** toggleable via double-tap or `bmo.local/`
+- **Web UI** at `bmo.local/` for test buttons + status + photos gallery + diagnostics
+
+### Where the animations live
+
+- `firmware/IdleLab/animations/<name>_anim.h` — generated headers (embedded into firmware binary)
+- `firmware/IdleLab/animations/source/<name>.{gif,webp}` — source files for regeneration
+- `scripts/gif_to_header.py` — converter. To swap a GIF: drop new file into `source/`, run `python3 scripts/gif_to_header.py source/karate.gif karate --max-width 320 --max-height 240 --cover --jpeg-quality 55 --max-frames 14`, recompile firmware.
+
+### Build/deploy commands (banked)
+
+```
+cd firmware/IdleLab
+/Applications/Arduino\ IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli \
+  compile --fqbn m5stack:esp32:m5stack_cores3 \
+  --build-property "build.partitions=esp_sr_16" \
+  --build-property "upload.maximum_size=3145728" .
+
+/Applications/Arduino\ IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli \
+  upload --fqbn m5stack:esp32:m5stack_cores3 \
+  --port /dev/cu.usbmodem1101 .
+```
+
+Currently using 91% of the 3MB app partition slot. If we add more big animations, may need to drop quality or frame counts further.
+
+### Old "Last updated" entry (kept for context)
+
+> Last updated end of 2026-05-22. Commit `5ae9147`. On-device "Hey Beepoh" wake word working + voice and tap "all done" gestures live + diagnostics endpoint at `bmo.local/tflm-status`.
 
 ### What's working right now
 
