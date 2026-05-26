@@ -611,6 +611,256 @@ void maybe_fire_micro() {
   next_micro_at = now + 1500 + random(0, 2000);  // 1.5-3.5 s (was 2.5-5.5)
 }
 
+// Forward decls so the secret-life routines (defined below) can use them.
+void set_led_override(uint8_t r, uint8_t g, uint8_t b,
+                      unsigned long ms, bool flash, bool sticky = false);
+extern bool wifi_setup_mode;
+extern volatile bool audio_test_pending;
+extern volatile bool tone_test_pending;
+
+// Pending secret-life trigger (set by the web route, consumed in main loop).
+// Using strings keeps the lambda body trivial.
+volatile bool         secret_life_pending = false;
+char                  secret_life_request[16] = "";
+
+// Hoisted up so Arduino auto-prototyping doesn't generate refs to these
+// before their declarations. Animation data headers (placeholder_anim.h,
+// karate_anim.h, etc.) provide instances; struct types are defined here once.
+struct AnimFrame { const uint8_t* data; size_t len; };
+struct Animation { const AnimFrame* frames; int frame_count;
+                   int width; int height; int frame_ms; };
+struct AnimPlayerState {
+  const Animation* anim;
+  int frame_idx;
+  unsigned long last_frame_ms;
+  int draw_x;
+  int draw_y;
+};
+void play_anim_init(AnimPlayerState* s, const Animation* anim);
+bool play_anim_step(AnimPlayerState* s);
+void delay_with_anim(unsigned long ms, AnimPlayerState* s);
+
+// === Secret-life animation playback ===
+// Loaded from animations/<name>_anim.h. Each header defines an `Animation`
+// struct with a JPEG frame array + frame_ms + dimensions. The player runs
+// the animation for a target duration, looping if needed, drawing each
+// frame to face_buffer and pushing to the display. Non-blocking version
+// (play_anim_step) lets routines interleave animation with motion+sound.
+#include "animations/placeholder_anim.h"
+#include "animations/karate_anim.h"
+#include "animations/soccer_anim.h"
+#include "animations/dance_anim.h"
+#include "animations/meditation_anim.h"
+#include "animations/random1_anim.h"
+#include "animations/random2_anim.h"
+#include "animations/random3_anim.h"
+#include "animations/random4_anim.h"
+
+// Pool of random secret-life animations -- pick one each fire
+static const Animation* random_anim_pool[] = {
+  &random1_anim, &random2_anim, &random3_anim, &random4_anim
+};
+
+void play_anim_init(AnimPlayerState* s, const Animation* anim) {
+  s->anim = anim;
+  s->frame_idx = 0;
+  s->last_frame_ms = 0;
+  // Center on the 320x240 screen
+  s->draw_x = (320 - anim->width)  / 2;
+  s->draw_y = (240 - anim->height) / 2;
+}
+
+// Advance one frame if it's time. Returns true if a new frame was drawn.
+bool play_anim_step(AnimPlayerState* s) {
+  if (!s || !s->anim) return false;
+  unsigned long now = millis();
+  if (s->last_frame_ms != 0 && (now - s->last_frame_ms) < (unsigned long)s->anim->frame_ms) {
+    return false;
+  }
+  const AnimFrame& f = s->anim->frames[s->frame_idx];
+  // Solid black background so frame edges don't show stale face content
+  face_buffer.fillScreen(0);
+  face_buffer.drawJpg(f.data, f.len, s->draw_x, s->draw_y, s->anim->width, s->anim->height);
+  face_buffer.pushSprite(&M5StackChan.Display(), 0, 0);
+  s->frame_idx = (s->frame_idx + 1) % s->anim->frame_count;
+  s->last_frame_ms = now;
+  return true;
+}
+
+// Drop-in replacement for delay() that keeps an animation drawing in the
+// background. Use inside secret-life routines so the screen stays alive
+// while motion/sound is happening.
+void delay_with_anim(unsigned long ms, AnimPlayerState* s) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    play_anim_step(s);
+    delay(10);
+  }
+}
+
+// === Beemo's secret life ===
+// When left alone for ~2 minutes with nothing happening, Beemo quietly does
+// something to itself: a karate kata, a soccer celebration, a secret dance.
+// These are bigger, slower productions than the regular idle behaviors --
+// each is a scripted ~8-12 second routine of motion + face + LED + sound.
+// You're not supposed to catch them. That's the fun.
+//
+// Triggered when:
+//   - quiet for >= SECRET_LIFE_QUIET_MS since last user interaction
+//   - at least SECRET_LIFE_MIN_INTERVAL_MS since the previous secret routine
+//   - nothing else is happening (no conversation, no response on screen)
+unsigned long last_secret_life_ms = 0;
+const unsigned long SECRET_LIFE_QUIET_MS         = 120000; // 2 min idle to trigger
+const unsigned long SECRET_LIFE_MIN_INTERVAL_MS  = 180000; // >= 3 min between routines
+
+void secret_karate_routine() {
+  Serial.println("[secret] karate kata");
+  current_idle_label   = "secret karate";
+  idle_label_until     = millis() + 12000;
+  // Sounds intentionally removed -- Amber found them jarring against the GIFs.
+  // Motion + LED + animation only.
+  face_override_active = false;
+
+  AnimPlayerState anim;
+  play_anim_init(&anim, &karate_anim);
+  play_anim_step(&anim);
+
+  for (int i = 0; i < 3; i++) {
+    M5StackChan.Motion.moveX(0, 200);     delay_with_anim(220, &anim);
+    set_led_override(255, 60, 60, 250, false);
+    M5StackChan.Motion.moveX(-380, 130);  delay_with_anim(180, &anim);
+    M5StackChan.Motion.moveX(0, 200);     delay_with_anim(180, &anim);
+    set_led_override(255, 60, 60, 250, false);
+    M5StackChan.Motion.moveX(380, 130);   delay_with_anim(180, &anim);
+    M5StackChan.Motion.moveX(0, 200);     delay_with_anim(250, &anim);
+  }
+  set_led_override(255, 200, 0, 600, false);
+  M5StackChan.Motion.moveY(380, 220);     delay_with_anim(240, &anim);
+  M5StackChan.Motion.moveY(500, 320);     delay_with_anim(400, &anim);
+  M5StackChan.Motion.moveY(560, 250);     delay_with_anim(300, &anim);
+  M5StackChan.Motion.moveY(500, 250);     delay_with_anim(300, &anim);
+  last_render_ms = 0;
+}
+
+void secret_soccer_routine() {
+  Serial.println("[secret] soccer practice");
+  current_idle_label   = "secret soccer";
+  idle_label_until     = millis() + 11000;
+  face_override_active = false;
+  AnimPlayerState anim; play_anim_init(&anim, &soccer_anim); play_anim_step(&anim);
+
+  for (int i = 0; i < 6; i++) {
+    M5StackChan.Motion.moveX(i & 1 ? -180 : 180, 200);
+    M5StackChan.Motion.moveY(i & 1 ? 470 : 510, 200);
+    delay_with_anim(230, &anim);
+  }
+  M5StackChan.Motion.moveX(-220, 250);
+  M5StackChan.Motion.moveY(520, 250);
+  delay_with_anim(260, &anim);
+  set_led_override(255, 255, 255, 200, false);
+  M5StackChan.Motion.moveX(380, 140);
+  delay_with_anim(150, &anim);
+  delay_with_anim(240, &anim);
+  set_led_override(0, 220, 80, 2500, false);
+  delay_with_anim(500, &anim);
+  M5StackChan.Motion.moveX(0, 400);
+  M5StackChan.Motion.moveY(500, 400);
+  delay_with_anim(450, &anim);
+  last_render_ms = 0;
+}
+
+void secret_dance_routine() {
+  Serial.println("[secret] solo disco");
+  current_idle_label   = "secret dance";
+  idle_label_until     = millis() + 10000;
+  face_override_active = false;
+  AnimPlayerState anim; play_anim_init(&anim, &dance_anim); play_anim_step(&anim);
+
+  const int xpos[]  = {-300, 300, -250, 250, -200, 200, -100, 0};
+  for (int i = 0; i < 8; i++) {
+    uint8_t r = (i & 1) ? 220 : 60;
+    uint8_t g = (i & 2) ? 220 : 60;
+    uint8_t b = (i & 4) ? 220 : 60;
+    set_led_override(r, g, b, 300, false);
+    M5StackChan.Motion.moveX(xpos[i], 280);
+    delay_with_anim(280, &anim);
+  }
+  set_led_override(255, 200, 100, 800, false);
+  M5StackChan.Motion.moveX(0, 500);
+  delay_with_anim(400, &anim);
+  last_render_ms = 0;
+}
+
+void secret_random_routine() {
+  // Pick one of the 4 user-supplied random BMO GIFs and play it with a
+  // generic upbeat sway routine. No sounds (Amber's preference).
+  const Animation* picked = random_anim_pool[random(0, 4)];
+  Serial.printf("[secret] random gif (%dx%d, %d frames)\n",
+                picked->width, picked->height, picked->frame_count);
+  current_idle_label   = "secret moment";
+  idle_label_until     = millis() + 10000;
+  face_override_active = false;
+  AnimPlayerState anim; play_anim_init(&anim, picked); play_anim_step(&anim);
+
+  const int xpos[]   = {-200, 200, -150, 150, -100, 0};
+  for (int i = 0; i < 6; i++) {
+    uint8_t r = 80 + (i * 25) % 175;
+    uint8_t g = 120 + (i * 35) % 135;
+    uint8_t b = 200 - (i * 15);
+    set_led_override(r, g, b, 400, false);
+    M5StackChan.Motion.moveX(xpos[i], 280);
+    delay_with_anim(320, &anim);
+  }
+  M5StackChan.Motion.moveX(0, 400);
+  delay_with_anim(500, &anim);
+  last_render_ms = 0;
+}
+
+void secret_meditation_routine() {
+  Serial.println("[secret] meditation");
+  current_idle_label   = "secret meditation";
+  idle_label_until     = millis() + 11000;
+  face_override_active = false;
+  AnimPlayerState anim; play_anim_init(&anim, &meditation_anim); play_anim_step(&anim);
+
+  // Three slow breath cycles: head rises slowly, falls slowly. Silent.
+  for (int i = 0; i < 3; i++) {
+    set_led_override(80, 80, 220, 2000, false);  // calm blue
+    M5StackChan.Motion.moveY(420, 1500);
+    delay_with_anim(1500, &anim);
+    M5StackChan.Motion.moveY(520, 1500);
+    delay_with_anim(1500, &anim);
+  }
+  M5StackChan.Motion.moveY(500, 400);
+  delay_with_anim(400, &anim);
+  last_render_ms = 0;
+}
+
+void maybe_fire_secret_life() {
+  if (quiet_mode) return;
+  if (showing_response || wifi_setup_mode || conversation_pending ||
+      audio_test_pending || tone_test_pending) return;
+  unsigned long now = millis();
+  if (now - last_interaction_ms < SECRET_LIFE_QUIET_MS) return;
+  if (last_secret_life_ms != 0 &&
+      (now - last_secret_life_ms) < SECRET_LIFE_MIN_INTERVAL_MS) return;
+
+  // Pick a random routine. Keep adding more here over time.
+  typedef void (*SecretRoutine)();
+  static const SecretRoutine routines[] = {
+    secret_karate_routine,
+    secret_soccer_routine,
+    secret_dance_routine,
+    secret_meditation_routine,
+    secret_random_routine,
+  };
+  int pick = random(0, sizeof(routines) / sizeof(routines[0]));
+  routines[pick]();
+  last_secret_life_ms = millis();
+  // Deliberately do NOT touch last_interaction_ms -- the secret life lives
+  // off the "user is away" clock, not the conversation clock.
+}
+
 void maybe_fire_idle() {
   unsigned long now = millis();
   float quiet_s = (now - last_interaction_ms) / 1000.0f;
@@ -664,7 +914,7 @@ unsigned long led_override_until = 0;
 bool led_override_flash = false;  // if true, alternate full/dim instead of solid
 bool led_override_sticky = false; // user-requested via tool; only another sticky can replace it
 
-void set_led_override(uint8_t r, uint8_t g, uint8_t b, unsigned long ms, bool flash, bool sticky = false) {
+void set_led_override(uint8_t r, uint8_t g, uint8_t b, unsigned long ms, bool flash, bool sticky) {
   // A sticky (user-asked-for) color can only be replaced by another sticky call.
   if (led_override_active && led_override_sticky && !sticky &&
       millis() < led_override_until) return;
@@ -2935,7 +3185,10 @@ void run_conversation() {
   conversation_done_via_voice = false;
   last_abort_tap_ms = 0;
   pending_done_tap_at_ms = 0;
-  const int MAX_TURNS = 10;
+  // Single-turn: after Beemo responds once, conversation ends. Re-engage
+  // by saying the wake word again or holding the touch strip. Multi-turn
+  // (was 10) was re-triggering from BMO's own audio echoes and ambient noise.
+  const int MAX_TURNS = 1;
   const int SILENCE_PEAK_THRESHOLD = 1500;  // peak below this = "user didn't speak"
 
   for (int turn = 0; turn < MAX_TURNS; turn++) {
@@ -3356,7 +3609,24 @@ void send_status_page() {
   html += (listening_mode ? "Turn always-listening OFF (require touch)"
                           : "Turn always-listening ON (voice activated)");
   html += "</button></form>"
-          "<p><a href='/photos'>BMO's photos &rarr;</a></p>";
+          "<p><a href='/photos'>BMO's photos &rarr;</a></p>"
+          "<h2>Beemo's secret life (test)</h2>"
+          "<p>Fire a secret-life routine now (normally only happens after 2 min idle):</p>"
+          "<form action='/secret-life' method='POST' style='display:inline'>"
+          "  <input type='hidden' name='r' value='karate'>"
+          "  <button type='submit'>Karate kata</button></form> "
+          "<form action='/secret-life' method='POST' style='display:inline'>"
+          "  <input type='hidden' name='r' value='soccer'>"
+          "  <button type='submit'>Soccer goal</button></form> "
+          "<form action='/secret-life' method='POST' style='display:inline'>"
+          "  <input type='hidden' name='r' value='dance'>"
+          "  <button type='submit'>Solo disco</button></form> "
+          "<form action='/secret-life' method='POST' style='display:inline'>"
+          "  <input type='hidden' name='r' value='meditation'>"
+          "  <button type='submit'>Meditation</button></form> "
+          "<form action='/secret-life' method='POST' style='display:inline'>"
+          "  <input type='hidden' name='r' value='random'>"
+          "  <button type='submit'>Random</button></form>";
   html += "<h2>Settings</h2>";
   html += "<p>Quiet mode: <b>";
   html += (quiet_mode ? "ON" : "off");
@@ -3439,6 +3709,15 @@ void register_status_routes() {
   });
   http_server.on("/toggle-quiet", HTTP_POST, []() {
     quiet_mode = !quiet_mode;
+    http_server.sendHeader("Location", "/", true);
+    http_server.send(302, "text/plain", "");
+  });
+  http_server.on("/secret-life", HTTP_POST, []() {
+    String r = http_server.arg("r");
+    if (r.length() == 0) r = "random";
+    strncpy(secret_life_request, r.c_str(), sizeof(secret_life_request) - 1);
+    secret_life_request[sizeof(secret_life_request) - 1] = 0;
+    secret_life_pending = true;
     http_server.sendHeader("Location", "/", true);
     http_server.send(302, "text/plain", "");
   });
@@ -3836,11 +4115,35 @@ void loop() {
     }
   }
 
+  // On-demand secret-life trigger from the web (test button). Bypasses
+  // both the 2-min quiet window and the 3-min interval throttle.
+  if (secret_life_pending) {
+    secret_life_pending = false;
+    String r = secret_life_request;
+    if      (r == "karate")     secret_karate_routine();
+    else if (r == "soccer")     secret_soccer_routine();
+    else if (r == "dance")      secret_dance_routine();
+    else if (r == "meditation") secret_meditation_routine();
+    else if (r == "random")     secret_random_routine();
+    else {
+      // Unknown -> pick one of the 5 routines
+      typedef void (*SR)();
+      static const SR routines[] = {
+        secret_karate_routine, secret_soccer_routine,
+        secret_dance_routine,  secret_meditation_routine,
+        secret_random_routine
+      };
+      routines[random(0, sizeof(routines)/sizeof(routines[0]))]();
+    }
+    last_secret_life_ms = millis();
+  }
+
   // Autonomous "alive" layer. Skipped when quiet_mode is on so BMO only
   // reacts to direct user input.
   if (!quiet_mode) {
     maybe_fire_micro();
     maybe_fire_idle();
+    maybe_fire_secret_life();
   }
 
   delay(20);
